@@ -1,0 +1,81 @@
+name: CI - Test Android Library
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'android-lib/**'
+      - 'rust/crates/crabmagick-core/**'
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and Unit Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager --install "ndk;26.1.10909125"
+
+      - name: Install Rust toolchain (aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rust -> target"
+          key: android-aarch64
+
+      - name: Cache Gradle files
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android-lib/**/*.kts', 'android-lib/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build Rust core (.so) for arm64-v8a
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.1.10909125
+          RUSTFLAGS: "-C target-feature=+neon"
+        run: |
+          cd rust
+          cargo ndk --target aarch64-linux-android build --release -p crabmagick-core
+          mkdir -p ../android-lib/crabmagick-jni/src/main/jniLibs/arm64-v8a
+          cp target/aarch64-linux-android/release/libcrabmagick.so \
+             ../android-lib/crabmagick-jni/src/main/jniLibs/arm64-v8a/libcrabmagick.so
+
+      - name: Run Kotlin unit tests
+        run: |
+          cd android-lib
+          ./gradlew :crabmagick-jni:testReleaseUnitTest --no-daemon
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: android-lib/crabmagick-jni/build/reports/tests/
