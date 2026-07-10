@@ -118,7 +118,7 @@ pub extern "system" fn Java_io_github_anaruto_libcrabmagick_CrabMagick_nativeApp
     _class: jni::objects::JClass<'local>,
     input_array: jni::objects::JByteArray<'local>,
 ) -> jni::sys::jbyteArray {
-    let mut handle_error = |env: &mut jni::JNIEnv, msg: &str| -> jni::sys::jbyteArray {
+    let handle_error = |env: &mut jni::JNIEnv, msg: &str| -> jni::sys::jbyteArray {
         let _ = env.throw_new("java/lang/RuntimeException", msg);
         std::ptr::null_mut()
     };
