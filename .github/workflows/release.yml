@@ -79,14 +79,10 @@ jobs:
              ../android-lib/crabmagick-jni/src/main/jniLibs/arm64-v8a/libcrabmagick.so
 
       - name: Run unit tests before releasing
-        run: |
-          cd android-lib
-          ./gradlew :crabmagick-jni:testReleaseUnitTest --no-daemon
+        run: ./gradlew -p android-lib :crabmagick-jni:testReleaseUnitTest --no-daemon
 
       - name: Assemble release AAR
-        run: |
-          cd android-lib
-          ./gradlew :crabmagick-jni:assembleRelease --no-daemon
+        run: ./gradlew -p android-lib :crabmagick-jni:assembleRelease --no-daemon
 
       - name: Rename AAR with version
         run: |

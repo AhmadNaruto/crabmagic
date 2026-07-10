@@ -69,9 +69,7 @@ jobs:
              ../android-lib/crabmagick-jni/src/main/jniLibs/arm64-v8a/libcrabmagick.so
 
       - name: Run Kotlin unit tests
-        run: |
-          cd android-lib
-          ./gradlew :crabmagick-jni:testReleaseUnitTest --no-daemon
+        run: ./gradlew -p android-lib :crabmagick-jni:testReleaseUnitTest --no-daemon
 
       - name: Upload test report
         if: always()
