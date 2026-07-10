@@ -1,0 +1,7 @@
+rust/target/
+bin/crabmagick-php8.4-x86_64-linux.so
+local.properties
+.gradle/
+.kotlin/
+build/
+*.aar

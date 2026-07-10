@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/crabmagick-core",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "fat"
+codegen-units = 8     # fat LTO merges these anyway; =1 hangs LLVM on 300k-line SIMD crate
+debug = false
+strip = "symbols"
+incremental = false
+debug-assertions = false
+overflow-checks = false
+
+[profile.bench]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 8
+debug = false
+strip = false
+incremental = false
+debug-assertions = false
+overflow-checks = false

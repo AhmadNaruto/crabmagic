@@ -1,0 +1,3198 @@
+//! Low-level decode, transform, and encode primitives used by CrabMagick.
+
+// Allow cfg-guarded returns and chunk patterns that can't use unstable as_chunks.
+#![allow(
+    clippy::needless_return,
+    clippy::collapsible_if,
+    clippy::chunks_exact_to_as_chunks
+)]
+
+use std::borrow::Cow;
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read};
+use std::num::NonZeroUsize;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat, XybSrgbParams};
+use fast_image_resize as fir;
+use image::{ColorType, GenericImageView};
+use lru::LruCache;
+use memmap2::Mmap;
+#[cfg(feature = "pdf")]
+use pdfium_render::prelude::*;
+#[cfg(feature = "avif")]
+use ravif::{
+    ColorModel as AvifColorModel, Encoder as AvifEncoder, Img as AvifImg, RGB8 as AvifRgb8,
+    RGBA8 as AvifRgba8,
+};
+use rayon::prelude::*;
+use resvg::{tiny_skia, usvg};
+use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
+
+use crate::jpeg_encode::encoder::{
+    ChromaSubsampling as JpegChromaSubsampling, EncoderConfig, HuffmanStrategy, ParallelEncoding,
+    PixelLayout as ZenLayout, ProgressiveScanMode, Unstoppable,
+};
+use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
+use crate::processor::{
+    ChromaSubsampling, CrabMagickError, EncodeOptions, ImageInfo, PngFilter, RequestedRegion,
+    TiffCompression,
+};
+
+// ── Core image and cache types ───────────────────────────────────────────────
+
+/// Owned RGB pixel data produced by the decoding pipeline.
+#[derive(Debug, Clone)]
+pub struct DecodedImage {
+    /// Packed `RGBRGB...` pixel bytes (always RGB, no alpha).
+    pub pixels: Vec<u8>,
+    /// Separate alpha channel (one byte per pixel, same spatial dims). None = fully opaque.
+    pub alpha: Option<Vec<u8>>,
+    /// Raw ICC profile bytes extracted from the source image.
+    pub icc: Option<Vec<u8>>,
+    /// Raw EXIF bytes extracted from the source image (without the "Exif\\0\\0" prefix).
+    pub exif: Option<Vec<u8>>,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+}
+
+type CacheKey = (String, u32);
+
+const SMALL_FILE_READ_THRESHOLD: u64 = 1_024 * 1_024;
+const AVERAGE_DECODED_IMAGE_BYTES: usize = 4 * 1_024 * 1_024;
+
+/// File-backed or owned input bytes used during decode.
+pub(crate) enum FileBytes {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Mmap(map) => map,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+struct CachedDecodedImage {
+    image: Arc<DecodedImage>,
+    bytes: usize,
+}
+
+struct DecodedImageCache {
+    entries: LruCache<CacheKey, CachedDecodedImage>,
+    bytes_limit: usize,
+    current_bytes: usize,
+}
+
+impl DecodedImageCache {
+    fn new(bytes_limit: usize) -> Self {
+        let estimated_items = bytes_limit
+            .saturating_div(AVERAGE_DECODED_IMAGE_BYTES)
+            .max(1);
+        let capacity = NonZeroUsize::new(estimated_items).expect("cache capacity is non-zero");
+        Self {
+            entries: LruCache::new(capacity),
+            bytes_limit,
+            current_bytes: 0,
+        }
+    }
+
+    fn reset(&mut self, bytes_limit: usize) {
+        *self = Self::new(bytes_limit);
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<DecodedImage>> {
+        if self.bytes_limit == 0 {
+            return None;
+        }
+        self.entries.get(key).map(|entry| Arc::clone(&entry.image))
+    }
+
+    fn put(&mut self, key: CacheKey, image: Arc<DecodedImage>) {
+        if self.bytes_limit == 0 {
+            return;
+        }
+
+        let bytes = image.pixels.len()
+            + image.alpha.as_ref().map_or(0, Vec::len)
+            + image.icc.as_ref().map_or(0, Vec::len)
+            + image.exif.as_ref().map_or(0, Vec::len);
+        if bytes > self.bytes_limit {
+            return;
+        }
+
+        if let Some(previous) = self.entries.put(key, CachedDecodedImage { image, bytes }) {
+            self.current_bytes = self.current_bytes.saturating_sub(previous.bytes);
+        }
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
+
+        while self.current_bytes > self.bytes_limit {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.current_bytes = self.current_bytes.saturating_sub(evicted.bytes);
+        }
+    }
+}
+
+static DECODED_IMAGE_CACHE: OnceLock<Mutex<DecodedImageCache>> = OnceLock::new();
+
+/// Source format detected from file signatures and lightweight probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFormat {
+    Jxl,
+    Jpeg,
+    Png,
+    Webp,
+    Tiff,
+    Gif,
+    Bmp,
+    Pdf,
+    Svg,
+    Avif,
+    Unknown,
+}
+
+// ── Cache helpers ────────────────────────────────────────────────────────────
+
+fn decoded_image_cache() -> &'static Mutex<DecodedImageCache> {
+    DECODED_IMAGE_CACHE.get_or_init(|| Mutex::new(DecodedImageCache::new(0)))
+}
+
+fn cacheable_full_decode(
+    format: SourceFormat,
+    region: Option<(u32, u32, u32, u32)>,
+    square: bool,
+) -> bool {
+    region.is_none()
+        && !square
+        && matches!(
+            format,
+            SourceFormat::Jxl
+                | SourceFormat::Jpeg
+                | SourceFormat::Png
+                | SourceFormat::Webp
+                | SourceFormat::Tiff
+                | SourceFormat::Gif
+                | SourceFormat::Bmp
+                | SourceFormat::Avif
+        )
+}
+
+fn cached_full_decode(path: &str, page: u32) -> Option<DecodedImage> {
+    let key = (path.to_owned(), page);
+    decoded_image_cache()
+        .lock()
+        .expect("decoded image cache lock poisoned")
+        .get(&key)
+        .map(|image| (*image).clone())
+}
+
+fn store_cached_full_decode(path: &str, page: u32, image: &DecodedImage) {
+    let key = (path.to_owned(), page);
+    decoded_image_cache()
+        .lock()
+        .expect("decoded image cache lock poisoned")
+        .put(key, Arc::new(image.clone()));
+}
+
+#[inline]
+pub(crate) fn init_decoded_image_cache(tile_cache_mb: u64) {
+    let bytes_limit = tile_cache_mb
+        .saturating_mul(1024)
+        .saturating_mul(1024)
+        .min(usize::MAX as u64) as usize;
+    decoded_image_cache()
+        .lock()
+        .expect("decoded image cache lock poisoned")
+        .reset(bytes_limit);
+}
+
+#[inline]
+pub(crate) fn read_file_bytes(path: &str) -> Result<FileBytes, CrabMagickError> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > SMALL_FILE_READ_THRESHOLD {
+        // SAFETY: The mapping is read-only and the file handle lives until after the map is
+        // created. The returned Mmap owns the OS mapping independently of the File.
+        let mapped = unsafe { Mmap::map(&file)? };
+        Ok(FileBytes::Mmap(mapped))
+    } else {
+        let mut reader = file;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        reader.read_to_end(&mut bytes)?;
+        Ok(FileBytes::Owned(bytes))
+    }
+}
+
+// ── JPEG XL encode configuration ─────────────────────────────────────────────
+
+/// Fine-grained JPEG XL encoder configuration for [`encode_jxl_rgb`].
+#[derive(Debug, Clone, Copy)]
+pub struct JxlEncodeOptions {
+    pub lossless: bool,
+    pub distance: Option<f32>,
+    pub effort: u8,
+    pub tier: u8,
+    pub threads: usize,
+    pub mode: EncoderMode,
+    pub max_strategy_size: Option<u8>,
+    pub force_strategy: Option<u8>,
+    pub custom_orders: Option<bool>,
+    pub adaptive_block_contexts: Option<bool>,
+    pub patches: Option<bool>,
+    pub lossless_tree_learning: Option<bool>,
+    pub lossless_lz77: Option<bool>,
+    pub lossless_squeeze: Option<bool>,
+    pub gaborish: Option<bool>,
+    pub pixel_domain_loss: Option<bool>,
+    pub adaptive_quant: Option<bool>,
+    pub adjust_quant_ac: Option<bool>,
+    pub chromacity_adjustment: Option<bool>,
+    pub cfl: Option<bool>,
+    pub cfl_two_pass: Option<bool>,
+    pub epf: Option<bool>,
+    pub epf_dynamic_sharpness: Option<bool>,
+    pub optimize_codes: Option<bool>,
+}
+
+impl Default for JxlEncodeOptions {
+    fn default() -> Self {
+        Self {
+            lossless: false,
+            distance: Some(1.0),
+            effort: 5,
+            tier: 0,
+            threads: 0,
+            mode: EncoderMode::Experimental,
+            max_strategy_size: None,
+            force_strategy: None,
+            custom_orders: None,
+            adaptive_block_contexts: None,
+            patches: None,
+            lossless_tree_learning: None,
+            lossless_lz77: None,
+            lossless_squeeze: None,
+            gaborish: None,
+            pixel_domain_loss: None,
+            adaptive_quant: None,
+            adjust_quant_ac: None,
+            chromacity_adjustment: None,
+            cfl: None,
+            cfl_two_pass: None,
+            epf: None,
+            epf_dynamic_sharpness: None,
+            optimize_codes: None,
+        }
+    }
+}
+
+// ── Error helpers ────────────────────────────────────────────────────────────
+
+fn decode_malformed(message: impl Into<String>) -> CrabMagickError {
+    CrabMagickError::decode_malformed(message)
+}
+
+fn decode_unsupported_format(message: impl Into<String>) -> CrabMagickError {
+    CrabMagickError::decode_unsupported_format(message)
+}
+
+fn encode_error(message: impl Into<String>) -> CrabMagickError {
+    CrabMagickError::encode_error(message)
+}
+
+fn region_out_of_bounds(region: RequestedRegion, image: ImageInfo) -> CrabMagickError {
+    CrabMagickError::region_out_of_bounds(region, image)
+}
+
+// ── Format detection ─────────────────────────────────────────────────────────
+
+/// Detects the source format from magic bytes and lightweight textual probes.
+///
+/// # Performance
+///
+/// This function reads only the leading bytes needed for signature matching and
+/// falls back to a small UTF-8 probe for SVG detection.
+#[inline]
+#[must_use]
+pub fn detect_format(bytes: &[u8]) -> SourceFormat {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0x0A {
+        return SourceFormat::Jxl;
+    }
+    if bytes.len() >= 8
+        && bytes[0] == 0x00
+        && bytes[1] == 0x00
+        && bytes[2] == 0x00
+        && &bytes[4..8] == b"JXL "
+    {
+        return SourceFormat::Jxl;
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return SourceFormat::Jpeg;
+    }
+    if bytes.len() >= 4 && &bytes[..4] == b"\x89PNG" {
+        return SourceFormat::Png;
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return SourceFormat::Webp;
+    }
+    if bytes.len() >= 4 && (&bytes[..4] == b"II*\0" || &bytes[..4] == b"MM\0*") {
+        return SourceFormat::Tiff;
+    }
+    if bytes.len() >= 4 && &bytes[..4] == b"GIF8" {
+        return SourceFormat::Gif;
+    }
+    if bytes.len() >= 2 && &bytes[..2] == b"BM" {
+        return SourceFormat::Bmp;
+    }
+    if bytes.len() >= 5 && &bytes[..5] == b"%PDF-" {
+        return SourceFormat::Pdf;
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"avif" || brand == b"avis" {
+            return SourceFormat::Avif;
+        }
+    }
+
+    let probe_len = bytes.len().min(1024);
+    let probe = String::from_utf8_lossy(&bytes[..probe_len]).to_ascii_lowercase();
+    let trimmed = probe.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && probe.contains("<svg")) {
+        return SourceFormat::Svg;
+    }
+
+    SourceFormat::Unknown
+}
+
+// ── Decode entry points ──────────────────────────────────────────────────────
+
+/// Decodes a full JPEG XL image from disk into packed RGB pixels.
+///
+/// # Performance
+///
+/// Large files are memory-mapped, and the decode stays inside the bundled JXL
+/// path without involving the generic `image` crate.
+pub fn decode_jxl(path: &str) -> Result<DecodedImage, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
+    decode_jxl_from_bytes(&bytes)
+}
+
+/// Decodes a full JPEG XL image from memory into packed RGB pixels.
+///
+/// # Performance
+///
+/// This is the lowest-overhead full-image JXL decode path exposed publicly.
+pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    decode_jxl_from_bytes_with_hint(bytes, None)
+}
+
+fn extract_jxl_alpha(
+    frame: &crate::jxl_decode::jxl_oxide::Render,
+    pixel_format: PixelFormat,
+) -> Option<Vec<u8>> {
+    if !pixel_format.has_alpha() {
+        return None;
+    }
+
+    let mut stream = frame.stream();
+    let channels = stream.channels() as usize;
+    let mut data = vec![0u8; stream.width() as usize * stream.height() as usize * channels];
+    let written = stream.write_to_buffer(&mut data);
+    debug_assert_eq!(written, data.len());
+
+    let alpha = data
+        .chunks_exact(channels)
+        .map(|pixel| pixel[channels - 1])
+        .collect();
+    maybe_some_alpha(alpha)
+}
+
+fn decode_jxl_from_bytes_with_hint(
+    bytes: &[u8],
+    render_size: Option<(u32, u32)>,
+) -> Result<DecodedImage, CrabMagickError> {
+    let image = create_jxl_image(bytes, render_size)?;
+
+    let width = image.width();
+    let height = image.height();
+    let pixel_format = image.pixel_format();
+    let icc = image.original_icc().map(|profile| profile.to_vec());
+
+    // Render the keyframe, deferring the XYB→sRGB color transform whenever it can be fused
+    // with the u8 RGB packing below (the common sRGB/VarDCT case).
+    let (frame, fused) = image
+        .render_frame_maybe_fused(0)
+        .map_err(|error| decode_malformed(format!("JPEG XL frame rendering failed: {error}")))?;
+    let pool = image.pool();
+    let alpha = extract_jxl_alpha(&frame, pixel_format);
+
+    // Fastest path: fuse XYB→sRGB (XybToMixedLms + 3×3 matrix + sRGB transfer) directly into
+    // interleaved u8 RGB in a single SIMD pass, skipping the standalone color-transform pass.
+    if let Some(params) = fused {
+        // `render_frame_maybe_fused` guarantees exactly 3 zero-copy XYB channels here.
+        let xyb = frame
+            .color_channels_raw_f32()
+            .expect("fuseable render guarantees zero-copy XYB channels");
+        let mut decoded = planar_to_rgb_fused_xyb_srgb(
+            xyb[0], xyb[1], xyb[2], width, height, &params, pool,
+        );
+        decoded.alpha = alpha;
+        decoded.icc = icc;
+        decoded.exif = None;
+        return Ok(decoded);
+    }
+
+    // Fast path: zero-copy — access the AlignedGrid<f32> buffers directly without
+    // allocating new FrameBuffers or doing the scalar per-pixel copy in `from_grids`.
+    if let Some(raw) = frame.color_channels_raw_f32() {
+        let mut decoded = planar_to_rgb(
+            pixel_format,
+            raw[0],
+            raw.get(1).copied(),
+            raw.get(2).copied(),
+            width,
+            height,
+            pool,
+        );
+        decoded.alpha = alpha;
+        decoded.icc = icc;
+        decoded.exif = None;
+        return Ok(decoded);
+    }
+
+    // Slow path: orientation != 1 or non-f32 channels
+    let planes = frame.image_planar();
+    let mut decoded = planar_to_rgb(
+        pixel_format,
+        planes[0].buf(),
+        planes.get(1).map(|plane| plane.buf()),
+        planes.get(2).map(|plane| plane.buf()),
+        width,
+        height,
+        pool,
+    );
+    decoded.alpha = alpha;
+    decoded.icc = icc;
+    decoded.exif = None;
+    Ok(decoded)
+}
+
+/// Decodes a rectangular JPEG XL region from disk into packed RGB pixels.
+///
+/// # Performance
+///
+/// Uses JXL decoder region decode so only the requested window is rendered.
+pub fn decode_jxl_region(
+    path: &str,
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
+    decode_jxl_region_from_bytes(&bytes, left, top, width, height)
+}
+
+/// Decodes a rectangular JPEG XL region from memory into packed RGB pixels.
+///
+/// # Performance
+///
+/// Uses JXL decoder region decode so only the requested window is rendered.
+pub fn decode_jxl_region_from_bytes(
+    bytes: &[u8],
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, CrabMagickError> {
+    decode_jxl_region_from_bytes_with_hint(bytes, left, top, width, height, None)
+}
+
+fn decode_jxl_region_from_bytes_with_hint(
+    bytes: &[u8],
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+    render_size: Option<(u32, u32)>,
+) -> Result<DecodedImage, CrabMagickError> {
+    let mut image = create_jxl_image(bytes, render_size)?;
+    let pixel_format = image.pixel_format();
+    let icc = image.original_icc().map(|profile| profile.to_vec());
+    let image_info = ImageInfo {
+        width: image.width(),
+        height: image.height(),
+    };
+    let region = RequestedRegion::new(left, top, width, height);
+    validate_requested_region(region, image_info)?;
+
+    image.set_image_region(CropInfo {
+        left,
+        top,
+        width,
+        height,
+    });
+
+    let frame = image
+        .render_frame(0)
+        .map_err(|error| decode_malformed(format!("JPEG XL region rendering failed: {error}")))?;
+    let pool = image.pool();
+    let alpha = extract_jxl_alpha(&frame, pixel_format);
+    if let Some(raw) = frame.color_channels_raw_f32() {
+        if raw.is_empty() {
+            return Err(decode_malformed(
+                "JPEG XL decode produced no image planes for the requested region",
+            ));
+        }
+        // The raw buffer length equals rendered_width * rendered_height; derive from buffer.
+        let rendered_pixels = raw[0].len() as u32;
+        let rendered_h = height.min(image.height().saturating_sub(top));
+        let rendered_w = if rendered_h > 0 {
+            rendered_pixels / rendered_h
+        } else {
+            0
+        };
+        let mut decoded = planar_to_rgb(
+            pixel_format,
+            raw[0],
+            raw.get(1).copied(),
+            raw.get(2).copied(),
+            rendered_w,
+            rendered_h,
+            pool,
+        );
+        decoded.alpha = alpha;
+        decoded.icc = icc;
+        decoded.exif = None;
+        return Ok(decoded);
+    }
+
+    let planes = frame.image_planar();
+    if planes.is_empty() {
+        return Err(decode_malformed(
+            "JPEG XL decode produced no image planes for the requested region",
+        ));
+    }
+
+    let mut decoded = planar_to_rgb(
+        pixel_format,
+        planes[0].buf(),
+        planes.get(1).map(|plane| plane.buf()),
+        planes.get(2).map(|plane| plane.buf()),
+        planes[0].width() as u32,
+        planes[0].height() as u32,
+        pool,
+    );
+    decoded.alpha = alpha;
+    decoded.icc = icc;
+    decoded.exif = None;
+    Ok(decoded)
+}
+
+/// Returns JPEG XL dimensions without fully rasterizing the image.
+pub fn decode_jxl_info(path: &str) -> Result<ImageInfo, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
+    decode_jxl_info_from_bytes(&bytes)
+}
+
+/// Returns JPEG XL dimensions from in-memory bytes.
+pub fn decode_jxl_info_from_bytes(bytes: &[u8]) -> Result<ImageInfo, CrabMagickError> {
+    let image = create_jxl_image(bytes, None)?;
+
+    Ok(ImageInfo {
+        width: image.width(),
+        height: image.height(),
+    })
+}
+
+fn create_jxl_image(
+    bytes: &[u8],
+    render_size: Option<(u32, u32)>,
+) -> Result<JxlImage, CrabMagickError> {
+    let _ = render_size;
+    // JXL decoder 0.12.6 exposes region cropping but does not currently expose a render-size or
+    // decode-scale hint on JxlImage/JxlImageBuilder, so we keep the requested size only as a
+    // future integration hook.
+    JxlImage::builder()
+        .read(Cursor::new(bytes))
+        .map_err(|error| decode_malformed(format!("JPEG XL header parsing failed: {error}")))
+}
+
+/// Decodes any supported source format into packed RGB pixels.
+///
+/// # Performance
+///
+/// Delegates to optimized format-specific decoders and keeps region handling in
+/// the lowest-cost path available for each codec.
+pub fn decode_any(
+    path: &str,
+    region: Option<(u32, u32, u32, u32)>,
+    square: bool,
+) -> Result<DecodedImage, CrabMagickError> {
+    decode_any_with_options(path, region, square, 0, None)
+}
+
+/// Returns source-image dimensions for any supported format.
+pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
+    match detect_format(&bytes) {
+        SourceFormat::Jxl => decode_jxl_info_from_bytes(&bytes),
+        SourceFormat::Svg => decode_svg_info(&bytes),
+        SourceFormat::Tiff if page > 0 => {
+            let image = decode_tiff_page(&bytes, page)?;
+            Ok(ImageInfo {
+                width: image.width,
+                height: image.height,
+            })
+        }
+        SourceFormat::Pdf => {
+            #[cfg(feature = "pdf")]
+            {
+                let image = decode_pdf_page(&bytes, page, 0, 0)?;
+                return Ok(ImageInfo {
+                    width: image.width,
+                    height: image.height,
+                });
+            }
+            #[cfg(not(feature = "pdf"))]
+            {
+                return Err(decode_unsupported_format(
+                    "PDF decoding is unavailable in this build; enable the `pdf` feature",
+                ));
+            }
+        }
+        SourceFormat::Avif => {
+            #[cfg(feature = "avif")]
+            {
+                let decoded = decode_via_image(&bytes)?;
+                return Ok(ImageInfo {
+                    width: decoded.width,
+                    height: decoded.height,
+                });
+            }
+            #[cfg(not(feature = "avif"))]
+            {
+                return Err(decode_unsupported_format(
+                    "AVIF decoding is unavailable in this build; enable the `avif` feature",
+                ));
+            }
+        }
+        SourceFormat::Jpeg
+        | SourceFormat::Png
+        | SourceFormat::Webp
+        | SourceFormat::Tiff
+        | SourceFormat::Gif
+        | SourceFormat::Bmp => {
+            let image = image::load_from_memory(&bytes).map_err(|error| {
+                decode_malformed(format!("source image decode failed: {error}"))
+            })?;
+            let (width, height) = image.dimensions();
+            Ok(ImageInfo { width, height })
+        }
+        SourceFormat::Unknown => Err(decode_unsupported_format(
+            "file signature did not match any supported image format",
+        )),
+    }
+}
+
+/// Decodes any supported source format with optional region and render hints.
+///
+/// # Performance
+///
+/// - Reuses the shared decoded-image LRU for cacheable full-image requests.
+/// - Routes JPEG and WebP through bundled fast decoders.
+/// - Sends JXL region requests directly to the partial-decode path.
+#[doc(hidden)]
+pub fn decode_any_with_options(
+    path: &str,
+    region: Option<(u32, u32, u32, u32)>,
+    square: bool,
+    page: u32,
+    render_size: Option<(u32, u32)>,
+) -> Result<DecodedImage, CrabMagickError> {
+    if region.is_none() && !square {
+        if let Some(image) = cached_full_decode(path, page) {
+            return Ok(image);
+        }
+    }
+
+    let bytes = read_file_bytes(path)?;
+    let format = detect_format(&bytes);
+
+    let image = match format {
+        SourceFormat::Jxl => {
+            if let Some((x, y, w, h)) = region {
+                decode_jxl_region_from_bytes_with_hint(&bytes, x, y, w, h, render_size)?
+            } else if square {
+                let info = decode_jxl_info_from_bytes(&bytes)?;
+                let side = info.width.min(info.height);
+                let left = (info.width - side) / 2;
+                let top = (info.height - side) / 2;
+                decode_jxl_region_from_bytes_with_hint(&bytes, left, top, side, side, render_size)?
+            } else {
+                decode_jxl_from_bytes_with_hint(&bytes, render_size)?
+            }
+        }
+        SourceFormat::Jpeg => {
+            let decoded = decode_jpeg_fast(&bytes).or_else(|_| decode_via_image(&bytes))?;
+            apply_post_decode_ops(decoded, region, square)?
+        }
+        SourceFormat::Png => {
+            apply_post_decode_ops(
+                decode_png_fast(&bytes).or_else(|_| decode_via_image(&bytes))?,
+                region,
+                square,
+            )?
+        }
+        SourceFormat::Gif | SourceFormat::Bmp => {
+            apply_post_decode_ops(decode_via_image(&bytes)?, region, square)?
+        }
+        SourceFormat::Webp => apply_post_decode_ops(decode_webp_fast(&bytes)?, region, square)?,
+        SourceFormat::Tiff => {
+            apply_post_decode_ops(decode_tiff_page(&bytes, page)?, region, square)?
+        }
+        SourceFormat::Svg => {
+            let (out_w, out_h) = render_size.unwrap_or((0, 0));
+            apply_post_decode_ops(decode_svg(&bytes, out_w, out_h)?, region, square)?
+        }
+        SourceFormat::Pdf => {
+            #[cfg(feature = "pdf")]
+            {
+                let (out_w, out_h) = render_size.unwrap_or((0, 0));
+                apply_post_decode_ops(decode_pdf_page(&bytes, page, out_w, out_h)?, region, square)?
+            }
+            #[cfg(not(feature = "pdf"))]
+            {
+                return Err(decode_unsupported_format(
+                    "PDF decoding is unavailable in this build; enable the `pdf` feature",
+                ));
+            }
+        }
+        SourceFormat::Avif => {
+            #[cfg(feature = "avif")]
+            {
+                apply_post_decode_ops(decode_via_image(&bytes)?, region, square)?
+            }
+            #[cfg(not(feature = "avif"))]
+            {
+                return Err(decode_unsupported_format(
+                    "AVIF decoding is unavailable in this build; enable the `avif` feature",
+                ));
+            }
+        }
+        SourceFormat::Unknown => {
+            return Err(decode_unsupported_format(
+                "file signature did not match any supported image format",
+            ));
+        }
+    };
+
+    if cacheable_full_decode(format, region, square) {
+        store_cached_full_decode(path, page, &image);
+    }
+
+    Ok(image)
+}
+
+// ── Image transforms ─────────────────────────────────────────────────────────
+
+/// Resizes a packed RGB image while preserving aspect ratio when one dimension is `0`.
+///
+/// # Performance
+///
+/// Uses `fast_image_resize` with a downscale-friendly filter choice and avoids
+/// work when the output size matches the input size.
+fn resize_channel_u8(
+    channel: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let source = fir::images::Image::from_vec_u8(src_w, src_h, channel.to_vec(), fir::PixelType::U8)
+        .expect("validated grayscale buffer");
+    let mut destination = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8);
+    let filter = if dst_w < src_w / 2 || dst_h < src_h / 2 {
+        fir::FilterType::Bilinear
+    } else {
+        fir::FilterType::CatmullRom
+    };
+    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
+    fir::Resizer::new()
+        .resize(&source, &mut destination, Some(&options))
+        .expect("resize should succeed for grayscale buffers");
+    destination.buffer().to_vec()
+}
+
+fn rotate_plane_u8(channel: &[u8], width: u32, height: u32, degrees: u16) -> Vec<u8> {
+    match degrees % 360 {
+        0 => channel.to_vec(),
+        180 => {
+            let stride = width as usize;
+            let src_height = height as usize;
+            let mut out = vec![0u8; channel.len()];
+            out.par_chunks_mut(stride).enumerate().for_each(|(row, dst)| {
+                let src = &channel[(src_height - 1 - row) * stride..][..stride];
+                for col in 0..stride {
+                    dst[col] = src[stride - 1 - col];
+                }
+            });
+            out
+        }
+        90 => {
+            let (ow, oh) = (width as usize, height as usize);
+            let mut out = vec![0u8; channel.len()];
+            out.par_chunks_mut(oh).enumerate().for_each(|(dst_row, dst_chunk)| {
+                for (dst_col, value) in dst_chunk.iter_mut().enumerate() {
+                    let src_row = oh - 1 - dst_col;
+                    let src_col = dst_row;
+                    *value = channel[src_row * ow + src_col];
+                }
+            });
+            out
+        }
+        270 => {
+            let (ow, oh) = (width as usize, height as usize);
+            let mut out = vec![0u8; channel.len()];
+            out.par_chunks_mut(oh).enumerate().for_each(|(dst_row, dst_chunk)| {
+                for (dst_col, value) in dst_chunk.iter_mut().enumerate() {
+                    let src_row = dst_col;
+                    let src_col = ow - 1 - dst_row;
+                    *value = channel[src_row * ow + src_col];
+                }
+            });
+            out
+        }
+        _ => channel.to_vec(),
+    }
+}
+
+fn crop_plane_u8(channel: &[u8], source_width: u32, region: RequestedRegion) -> Vec<u8> {
+    let source_stride = source_width as usize;
+    let destination_stride = region.width as usize;
+    let mut out = vec![0u8; (region.width * region.height) as usize];
+    for row in 0..region.height as usize {
+        let src_offset = (region.top as usize + row) * source_stride + region.left as usize;
+        let dst_offset = row * destination_stride;
+        out[dst_offset..dst_offset + destination_stride]
+            .copy_from_slice(&channel[src_offset..src_offset + destination_stride]);
+    }
+    out
+}
+
+#[inline]
+#[must_use]
+pub fn resize_rgb(image: DecodedImage, output_width: u32, output_height: u32) -> DecodedImage {
+    if image.width == 0 || image.height == 0 {
+        return image;
+    }
+
+    let (target_width, target_height) =
+        resolve_output_size(image.width, image.height, output_width, output_height);
+    if target_width == image.width && target_height == image.height {
+        return image;
+    }
+
+    let filter = if target_width < image.width / 2 || target_height < image.height / 2 {
+        fir::FilterType::Bilinear
+    } else {
+        fir::FilterType::CatmullRom
+    };
+
+    let DecodedImage {
+        pixels,
+        alpha,
+        icc,
+        exif,
+        width,
+        height,
+    } = image;
+
+    let source = fir::images::Image::from_vec_u8(width, height, pixels, fir::PixelType::U8x3)
+    .expect("validated RGB buffer");
+    let mut destination =
+        fir::images::Image::new(target_width, target_height, fir::PixelType::U8x3);
+
+    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
+    fir::Resizer::new()
+        .resize(&source, &mut destination, Some(&options))
+        .expect("resize should succeed for RGB buffers");
+
+    DecodedImage {
+        pixels: destination.buffer().to_vec(),
+        alpha: alpha.map(|channel| resize_channel_u8(&channel, width, height, target_width, target_height)),
+        icc,
+        exif,
+        width: target_width,
+        height: target_height,
+    }
+}
+
+/// Rotates a packed RGB image clockwise by `0`, `90`, `180`, or `270` degrees.
+///
+/// # Performance
+///
+/// The outer row loop is parallelized with Rayon for all non-trivial rotations.
+#[inline]
+#[must_use]
+pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
+    match degrees % 360 {
+        0 => image,
+        180 => {
+            let DecodedImage {
+                pixels: src_pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            } = image;
+            let stride = width as usize * 3;
+            let src_height = height as usize;
+            let src_width = width as usize;
+            let mut pixels = vec![0u8; src_pixels.len()];
+            pixels
+                .par_chunks_mut(stride)
+                .enumerate()
+                .for_each(|(row, dst)| {
+                    let src = &src_pixels[(src_height - 1 - row) * stride..][..stride];
+                    for col in 0..src_width {
+                        dst[col * 3..col * 3 + 3]
+                            .copy_from_slice(&src[(src_width - 1 - col) * 3..][..3]);
+                    }
+                });
+            DecodedImage {
+                pixels,
+                alpha: alpha.map(|channel| rotate_plane_u8(&channel, width, height, 180)),
+                icc,
+                exif,
+                width,
+                height,
+            }
+        }
+        90 => {
+            let DecodedImage {
+                pixels: src_pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            } = image;
+            let (ow, oh) = (width as usize, height as usize);
+            let mut pixels = vec![0u8; src_pixels.len()];
+            pixels
+                .par_chunks_mut(oh * 3)
+                .enumerate()
+                .for_each(|(dst_row, dst_chunk)| {
+                    for dst_col in 0..oh {
+                        let src_row = oh - 1 - dst_col;
+                        let src_col = dst_row;
+                        dst_chunk[dst_col * 3..dst_col * 3 + 3]
+                            .copy_from_slice(&src_pixels[(src_row * ow + src_col) * 3..][..3]);
+                    }
+                });
+            DecodedImage {
+                pixels,
+                alpha: alpha.map(|channel| rotate_plane_u8(&channel, width, height, 90)),
+                icc,
+                exif,
+                width: height,
+                height: width,
+            }
+        }
+        270 => {
+            let DecodedImage {
+                pixels: src_pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            } = image;
+            let (ow, oh) = (width as usize, height as usize);
+            let mut pixels = vec![0u8; src_pixels.len()];
+            pixels
+                .par_chunks_mut(oh * 3)
+                .enumerate()
+                .for_each(|(dst_row, dst_chunk)| {
+                    for dst_col in 0..oh {
+                        let src_row = dst_col;
+                        let src_col = ow - 1 - dst_row;
+                        dst_chunk[dst_col * 3..dst_col * 3 + 3]
+                            .copy_from_slice(&src_pixels[(src_row * ow + src_col) * 3..][..3]);
+                    }
+                });
+            DecodedImage {
+                pixels,
+                alpha: alpha.map(|channel| rotate_plane_u8(&channel, width, height, 270)),
+                icc,
+                exif,
+                width: height,
+                height: width,
+            }
+        }
+        _ => image,
+    }
+}
+
+// ── Encode entry points ──────────────────────────────────────────────────────
+
+/// Encodes a packed RGB image into one of CrabMagick's output formats.
+///
+/// # Performance
+///
+/// Reuses format-specific fast paths and avoids constructing intermediary image
+/// wrappers except where the downstream encoder requires them.
+#[inline]
+#[must_use]
+pub fn encode(image: DecodedImage, options: &EncodeOptions) -> Result<Vec<u8>, CrabMagickError> {
+    let DecodedImage {
+        pixels,
+        alpha,
+        icc,
+        exif,
+        width,
+        height,
+    } = image;
+    let alpha = alpha.as_deref();
+    let icc = icc.as_deref();
+    let exif = exif.as_deref();
+
+    match options {
+        EncodeOptions::Jpeg(options) => {
+            encode_jpeg_rgb(&pixels, width, height, options, alpha, icc, exif)
+        }
+        EncodeOptions::Webp(options) => encode_webp_rgb(&pixels, width, height, options, alpha),
+        EncodeOptions::Png(options) => encode_png_rgb(&pixels, width, height, options, alpha, icc, exif),
+        EncodeOptions::Jxl(options) => encode_jxl_with_alpha(
+            &pixels,
+            width,
+            height,
+            &JxlEncodeOptions {
+                distance: Some(
+                    options
+                        .distance
+                        .unwrap_or_else(|| distance_from_quality(options.quality)),
+                ),
+                effort: options.effort.clamp(1, 9),
+                lossless: options.lossless,
+                tier: options.tier.min(4),
+                ..JxlEncodeOptions::default()
+            },
+            alpha,
+        ),
+        EncodeOptions::Avif(options) => encode_avif_rgb(&pixels, width, height, options, alpha),
+        EncodeOptions::Tiff(options) => encode_tiff_with_alpha(&pixels, width, height, options, alpha),
+        EncodeOptions::Gif(options) => encode_gif_with_alpha(&pixels, width, height, options, alpha),
+        EncodeOptions::Bmp => encode_bmp_with_alpha(&pixels, width, height, alpha),
+    }
+}
+
+fn validate_rgb8_buffer(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(), CrabMagickError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3))
+        .ok_or_else(|| encode_error(format!("{label} dimensions overflow")))?;
+    if pixels.len() != expected {
+        return Err(encode_error(format!(
+            "{label} encoding expected {expected} RGB bytes but received {}",
+            pixels.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_alpha8_buffer(
+    alpha: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(), CrabMagickError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| encode_error(format!("{label} dimensions overflow")))?;
+    if alpha.len() != expected {
+        return Err(encode_error(format!(
+            "{label} encoding expected {expected} alpha bytes but received {}",
+            alpha.len()
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn maybe_some_alpha(alpha: Vec<u8>) -> Option<Vec<u8>> {
+    if alpha.iter().all(|&value| value == 255) {
+        None
+    } else {
+        Some(alpha)
+    }
+}
+
+#[inline]
+fn split_rgba_to_rgb_alpha(rgba: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut pixels = Vec::with_capacity(rgba.len() / 4 * 3);
+    let mut alpha = Vec::with_capacity(rgba.len() / 4);
+    for chunk in rgba.chunks_exact(4) {
+        pixels.extend_from_slice(&chunk[..3]);
+        alpha.push(chunk[3]);
+    }
+    (pixels, maybe_some_alpha(alpha))
+}
+
+#[inline]
+fn split_ga_to_rgb_alpha(ga: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut pixels = Vec::with_capacity(ga.len() / 2 * 3);
+    let mut alpha = Vec::with_capacity(ga.len() / 2);
+    for chunk in ga.chunks_exact(2) {
+        pixels.extend_from_slice(&[chunk[0], chunk[0], chunk[0]]);
+        alpha.push(chunk[1]);
+    }
+    (pixels, maybe_some_alpha(alpha))
+}
+
+#[inline]
+fn interleave_rgba(pixels: &[u8], alpha: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(alpha.len() * 4);
+    for (rgb, &a) in pixels.chunks_exact(3).zip(alpha.iter()) {
+        out.extend_from_slice(rgb);
+        out.push(a);
+    }
+    out
+}
+
+#[inline]
+fn composite_alpha_to_white(pixels: &[u8], alpha: &[u8]) -> Vec<u8> {
+    pixels
+        .chunks_exact(3)
+        .zip(alpha.iter())
+        .flat_map(|(rgb, &a)| {
+            let a = a as u32;
+            let inv = 255 - a;
+            [
+                ((rgb[0] as u32 * a + 255 * inv) / 255) as u8,
+                ((rgb[1] as u32 * a + 255 * inv) / 255) as u8,
+                ((rgb[2] as u32 * a + 255 * inv) / 255) as u8,
+            ]
+        })
+        .collect()
+}
+
+fn extract_jpeg_exif(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+
+    let mut i = 2usize;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0xFF {
+            break;
+        }
+        let marker = bytes[i + 1];
+        let length = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if length < 2 {
+            break;
+        }
+        let data_end = i + 2 + length;
+        if data_end > bytes.len() {
+            break;
+        }
+        if marker == 0xE1 && i + 10 <= data_end && &bytes[i + 4..i + 10] == b"Exif\0\0" {
+            return Some(bytes[i + 10..data_end].to_vec());
+        }
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        i += 2 + length;
+    }
+
+    None
+}
+
+fn inject_jpeg_metadata(jpeg: Vec<u8>, icc: Option<&[u8]>, exif: Option<&[u8]>) -> Vec<u8> {
+    if icc.is_none() && exif.is_none() {
+        return jpeg;
+    }
+    if jpeg.len() < 2 || jpeg[..2] != [0xFF, 0xD8] {
+        return jpeg;
+    }
+
+    let extra_capacity = icc.map_or(0, |data| data.len() + 32) + exif.map_or(0, |data| data.len() + 16);
+    let mut out = Vec::with_capacity(jpeg.len() + extra_capacity);
+    out.extend_from_slice(&jpeg[..2]);
+
+    if let Some(exif_data) = exif.filter(|data| data.len() <= u16::MAX as usize - 8) {
+        let segment_len = exif_data.len() + 8;
+        out.extend_from_slice(&[0xFF, 0xE1, (segment_len >> 8) as u8, segment_len as u8]);
+        out.extend_from_slice(b"Exif\0\0");
+        out.extend_from_slice(exif_data);
+    }
+
+    if let Some(icc_data) = icc {
+        const MAX_CHUNK: usize = 65_519;
+        let total_chunks = icc_data.len().div_ceil(MAX_CHUNK);
+        if total_chunks <= u8::MAX as usize {
+            for (idx, chunk) in icc_data.chunks(MAX_CHUNK).enumerate() {
+                let segment_len = chunk.len() + 16;
+                out.extend_from_slice(&[0xFF, 0xE2, (segment_len >> 8) as u8, segment_len as u8]);
+                out.extend_from_slice(b"ICC_PROFILE\0");
+                out.push((idx + 1) as u8);
+                out.push(total_chunks as u8);
+                out.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+fn jpeg_subsampling(mode: ChromaSubsampling, quality: u8) -> JpegChromaSubsampling {
+    match mode {
+        ChromaSubsampling::Auto if quality < 90 => JpegChromaSubsampling::Quarter,
+        ChromaSubsampling::Auto | ChromaSubsampling::Cs444 => JpegChromaSubsampling::None,
+        ChromaSubsampling::Cs420 => JpegChromaSubsampling::Quarter,
+        ChromaSubsampling::Cs422 => JpegChromaSubsampling::HalfHorizontal,
+    }
+}
+
+fn png_compression_type(level: u8) -> png::Compression {
+    match level {
+        0..=2 => png::Compression::Fast,
+        3..=6 => png::Compression::Default,
+        _ => png::Compression::Best,
+    }
+}
+
+fn png_filter_type(filter: PngFilter) -> (png::FilterType, png::AdaptiveFilterType) {
+    match filter {
+        PngFilter::None => (png::FilterType::NoFilter, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Sub => (png::FilterType::Sub, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Up => (png::FilterType::Up, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Avg => (png::FilterType::Avg, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Paeth => (png::FilterType::Paeth, png::AdaptiveFilterType::NonAdaptive),
+        // Adaptive filter selection degrades badly at low zlib compression levels.
+        // Paeth is near-optimal for most content and works well at all compression levels.
+        PngFilter::All => (png::FilterType::Paeth, png::AdaptiveFilterType::NonAdaptive),
+    }
+}
+
+fn expand_u8_to_u16_native_endian(samples: &[u8]) -> Vec<u8> {
+    let mut expanded = Vec::with_capacity(samples.len() * 2);
+    for &value in samples {
+        let widened = ((value as u16) << 8) | value as u16;
+        expanded.extend_from_slice(&widened.to_ne_bytes());
+    }
+    expanded
+}
+
+fn encode_jpeg_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::JpegEncodeOptions,
+    alpha: Option<&[u8]>,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    validate_rgb8_buffer(pixels, width, height, "JPEG")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "JPEG")?;
+    }
+    let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
+
+    let quality = options.quality.clamp(1, 100);
+    // Progressive always requires Huffman optimization (two-pass).
+    // For baseline, respect the user's optimize_huffman flag; default is fast single-pass.
+    let huffman = if options.progressive || options.optimize_huffman {
+        HuffmanStrategy::Optimize
+    } else {
+        HuffmanStrategy::Fixed
+    };
+    let config = EncoderConfig::ycbcr(
+        quality,
+        jpeg_subsampling(options.chroma_subsampling, quality),
+    )
+    .scan_mode(if options.progressive {
+        ProgressiveScanMode::Progressive
+    } else {
+        ProgressiveScanMode::Baseline
+    })
+    .huffman(huffman)
+    .restart_mcu_rows(options.restart_interval)
+    .parallel(ParallelEncoding::Auto);
+
+    let mut encoder = config
+        .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
+        .map_err(|error| encode_error(format!("JPEG encoder initialization failed: {error}")))?;
+    encoder
+        .push_packed(&pixels, Unstoppable)
+        .map_err(|error| encode_error(format!("JPEG pixel upload failed: {error}")))?;
+    encoder
+        .finish()
+        .map(|jpeg| inject_jpeg_metadata(jpeg, icc, exif))
+        .map_err(|error| encode_error(format!("JPEG finalization failed: {error}")))
+}
+
+fn encode_webp_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::WebpEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    validate_rgb8_buffer(pixels, width, height, "WebP")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "WebP")?;
+    }
+
+    if options.near_lossless {
+        let mut config = webp::WebPConfig::new().map_err(|error| {
+            encode_error(format!("WebP config initialization failed: {error:?}"))
+        })?;
+        config.lossless = 1;
+        config.near_lossless = options.quality.min(100) as i32;
+        config.quality = 100.0;
+        config.method = options.effort.min(6) as i32;
+        config.alpha_quality = options.alpha_quality.min(100) as i32;
+
+        return if let Some(alpha) = alpha {
+            let rgba = interleave_rgba(pixels, alpha);
+            webp::Encoder::from_rgba(&rgba, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("near-lossless WebP encoding failed: {error:?}")))
+        } else {
+            webp::Encoder::from_rgb(pixels, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("near-lossless WebP encoding failed: {error:?}")))
+        };
+    }
+
+    if options.lossless {
+        let mut out = Vec::new();
+        let rgba = alpha.map(|alpha| interleave_rgba(pixels, alpha));
+        let (pixels_to_encode, color_type) = if let Some(rgba) = rgba.as_ref() {
+            (rgba.as_slice(), crate::webp_decode::ColorType::Rgba8)
+        } else {
+            (pixels, crate::webp_decode::ColorType::Rgb8)
+        };
+        let mut enc = crate::webp_decode::WebPEncoder::new(&mut out);
+        enc.set_params(crate::webp_decode::EncoderParams {
+            use_predictor_transform: true,
+            effort: options.effort.min(6),
+        });
+        enc.encode(pixels_to_encode, width, height, color_type)
+            .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
+        Ok(out)
+    } else {
+        let mut config = webp::WebPConfig::new().map_err(|error| {
+            encode_error(format!("WebP config initialization failed: {error:?}"))
+        })?;
+        config.lossless = 0;
+        config.quality = options.quality.min(100) as f32;
+        config.method = options.effort.min(6) as i32;
+        config.alpha_quality = options.alpha_quality.min(100) as i32;
+
+        if let Some(alpha) = alpha {
+            let rgba = interleave_rgba(pixels, alpha);
+            webp::Encoder::from_rgba(&rgba, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("WebP encoding failed: {error:?}")))
+        } else {
+            webp::Encoder::from_rgb(pixels, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("WebP encoding failed: {error:?}")))
+        }
+    }
+}
+
+fn encode_png_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::PngEncodeOptions,
+    alpha: Option<&[u8]>,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    validate_rgb8_buffer(pixels, width, height, "PNG")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "PNG")?;
+    }
+
+    let mut out = Vec::new();
+    let mut info = png::Info::with_size(width, height);
+    info.bit_depth = if options.bitdepth == 16 {
+        png::BitDepth::Sixteen
+    } else {
+        png::BitDepth::Eight
+    };
+    info.color_type = if alpha.is_some() {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    };
+    info.interlaced = options.progressive;
+    info.icc_profile = icc.map(|profile| Cow::Owned(profile.to_vec()));
+    info.exif_metadata = exif.map(|metadata| Cow::Owned(metadata.to_vec()));
+
+    {
+        let mut encoder = png::Encoder::with_info(&mut out, info)
+            .map_err(|error| encode_error(format!("PNG encoder initialization failed: {error}")))?;
+        encoder.set_compression(png_compression_type(options.compression.min(9)));
+        let (filter, adaptive_filter) = png_filter_type(options.filter);
+        encoder.set_filter(filter);
+        encoder.set_adaptive_filter(adaptive_filter);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| encode_error(format!("PNG header encoding failed: {error}")))?;
+
+        let image_data = if let Some(alpha) = alpha {
+            interleave_rgba(pixels, alpha)
+        } else {
+            pixels.to_vec()
+        };
+
+        if options.bitdepth == 16 {
+            writer
+                .write_image_data(&expand_u8_to_u16_native_endian(&image_data))
+                .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+        } else {
+            writer
+                .write_image_data(&image_data)
+                .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+        }
+    }
+    Ok(out)
+}
+
+/// Encodes packed RGB pixels into TIFF using the selected compression method.
+pub fn encode_tiff_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::TiffEncodeOptions,
+) -> Result<Vec<u8>, CrabMagickError> {
+    encode_tiff_with_alpha(pixels, width, height, options, None)
+}
+
+fn encode_tiff_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::TiffEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    use std::io::Cursor;
+    use tiff::encoder::{
+        colortype::{RGB8, RGBA8},
+        Compression, Predictor, TiffEncoder,
+    };
+
+    validate_rgb8_buffer(pixels, width, height, "TIFF")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "TIFF")?;
+    }
+    let _ = (options.tiled, options.tile_width, options.tile_height, options.quality);
+
+    let compression = match options.compression {
+        TiffCompression::None     => Compression::Uncompressed,
+        TiffCompression::Lzw      => Compression::Lzw,
+        TiffCompression::Deflate  => Compression::Deflate(Default::default()),
+        TiffCompression::Packbits => Compression::Packbits,
+        TiffCompression::Jpeg     => {
+            eprintln!(
+                "[crabmagick-core] TIFF JPEG compression unavailable in tiff-rs; using Deflate"
+            );
+            Compression::Deflate(Default::default())
+        }
+    };
+
+    // Horizontal differencing predictor dramatically improves LZW/deflate ratios
+    // (same as libvips default). Only compatible with integer colour types — always
+    // safe for RGB8.
+    let predictor = if options.predictor
+        && !matches!(options.compression, TiffCompression::None | TiffCompression::Packbits)
+    {
+        Predictor::Horizontal
+    } else {
+        Predictor::None
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut encoder = TiffEncoder::new(&mut cursor)
+            .map_err(|error| encode_error(format!("TIFF encoder init failed: {error}")))?
+            .with_compression(compression)
+            .with_predictor(predictor);
+        if let Some(alpha) = alpha {
+            let rgba = interleave_rgba(pixels, alpha);
+            encoder
+                .write_image::<RGBA8>(width, height, &rgba)
+                .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        } else {
+            encoder
+                .write_image::<RGB8>(width, height, pixels)
+                .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        }
+    }
+    Ok(cursor.into_inner())
+}
+
+/// Encodes packed RGB8 pixels into a 256-color GIF.
+///
+/// GIF is inherently palettized, so the encoder quantizes to 256 colors. The
+/// current `image` crate backend exposes only a speed knob; dither and palette
+/// bit depth are retained for API parity and future implementation work.
+pub fn encode_gif_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::GifEncodeOptions,
+) -> Result<Vec<u8>, CrabMagickError> {
+    encode_gif_with_alpha(pixels, width, height, options, None)
+}
+
+fn encode_gif_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::GifEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    use image::codecs::gif::GifEncoder;
+
+    validate_rgb8_buffer(pixels, width, height, "GIF")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "GIF")?;
+    }
+    let _ = (options.dither, options.bitdepth);
+    let effort = options.effort.clamp(1, 10) as i32;
+    let speed = (30 - ((effort - 1) * 29 / 9)).clamp(1, 30);
+    let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = GifEncoder::new_with_speed(&mut out, speed);
+        encoder
+            .encode(&pixels, width, height, ColorType::Rgb8.into())
+            .map_err(|error| encode_error(format!("GIF encoding failed: {error}")))?;
+    }
+    Ok(out)
+}
+
+/// Encodes packed RGB8 pixels into an uncompressed BMP.
+///
+/// BMP is lossless and stores pixels bottom-up as BGR; the `image` crate
+/// handles the header and channel ordering. `pixels` must be tightly packed
+/// `width * height * 3` RGB8 bytes.
+pub fn encode_bmp_rgb(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CrabMagickError> {
+    encode_bmp_with_alpha(pixels, width, height, None)
+}
+
+fn encode_bmp_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    use image::codecs::bmp::BmpEncoder;
+
+    validate_rgb8_buffer(pixels, width, height, "BMP")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "BMP")?;
+    }
+    let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
+
+    let mut out = Vec::new();
+    BmpEncoder::new(&mut out)
+        .encode(&pixels, width, height, ColorType::Rgb8.into())
+        .map_err(|error| encode_error(format!("BMP encoding failed: {error}")))?;
+    Ok(out)
+}
+
+/// Losslessly repackages a JPEG file into a JXL container (cjxl `--lossless_jpeg=1` equivalent).
+///
+/// The DCT coefficients are extracted from the JPEG and stored verbatim inside a JXL frame.
+/// The original JPEG bytes can be reconstructed exactly from the output. Typical size reduction
+/// is 15–30% over the source JPEG with zero quality loss.
+///
+/// # Errors
+///
+/// Returns an error if `jpeg_bytes` is not a valid JPEG or if encoding fails.
+#[cfg(feature = "jpeg-reencoding")]
+pub fn transcode_jpeg_to_jxl(jpeg_bytes: &[u8]) -> Result<Vec<u8>, CrabMagickError> {
+    use crate::jxl_encode::jpeg::read_jpeg;
+    use crate::jxl_encode::jpeg::encode_jpeg_to_jxl_container;
+    let jpeg = read_jpeg(jpeg_bytes)
+        .map_err(|e| encode_error(format!("JPEG parse failed: {e}")))?;
+    encode_jpeg_to_jxl_container(&jpeg)
+        .map_err(|e| encode_error(format!("JPEG→JXL repackage failed: {e}")))
+}
+
+/// Losslessly repackages a JPEG file on disk into a JXL container.
+///
+/// Reads `path`, parses DCT coefficients, and returns JXL bytes. The original JPEG
+/// can be recovered exactly from the output with `djxl --pixels_to_jpeg`.
+#[cfg(feature = "jpeg-reencoding")]
+pub fn transcode_jpeg_file_to_jxl(path: &str) -> Result<Vec<u8>, CrabMagickError> {
+    let jpeg_bytes = read_file_bytes(path)?;
+    transcode_jpeg_to_jxl(&jpeg_bytes)
+}
+
+/// Encodes packed RGB pixels into JPEG XL using bundled encoder modules.
+///
+/// # Performance
+///
+/// Keeps the call entirely within the bundled same-crate encoder stack so the
+/// optimizer can inline configuration and dispatch code across former crate
+/// boundaries.
+#[inline]
+#[must_use]
+pub fn encode_jxl_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &JxlEncodeOptions,
+) -> Result<Vec<u8>, CrabMagickError> {
+    encode_jxl_with_alpha(pixels, width, height, options, None)
+}
+
+fn encode_jxl_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &JxlEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    let _ = options.tier;
+    validate_rgb8_buffer(pixels, width, height, "JPEG XL")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "JPEG XL")?;
+    }
+    let jxl_pixels = alpha.map(|alpha| interleave_rgba(pixels, alpha));
+    let (pixels, layout) = if let Some(pixels) = jxl_pixels.as_ref() {
+        (pixels.as_slice(), JxlLayout::Rgba8)
+    } else {
+        (pixels, JxlLayout::Rgb8)
+    };
+
+    if options.lossless {
+        let mut config = LosslessConfig::new()
+            .with_effort(options.effort)
+            .with_mode(options.mode)
+            .with_threads(options.threads);
+        if let Some(v) = options.patches {
+            config = config.with_patches(v);
+        }
+        if let Some(v) = options.lossless_tree_learning {
+            config = config.with_tree_learning(v);
+        }
+        if let Some(v) = options.lossless_lz77 {
+            config = config.with_lz77(v);
+        }
+        if let Some(v) = options.lossless_squeeze {
+            config = config.with_squeeze(v);
+        }
+        config
+            .encode(pixels, width, height, layout)
+            .map_err(|error| encode_error(format!("lossless JPEG XL encoding failed: {error}")))
+    } else {
+        let mut config = LossyConfig::new(options.distance.unwrap_or(1.0))
+            .with_effort(options.effort)
+            .with_mode(options.mode)
+            .with_threads(options.threads);
+        if let Some(v) = options.max_strategy_size {
+            config = config.with_max_strategy_size(Some(v));
+        }
+        if let Some(v) = options.force_strategy {
+            config = config.with_force_strategy(Some(v));
+        }
+        if let Some(v) = options.custom_orders {
+            config = config.with_custom_orders(v);
+        }
+        if let Some(v) = options.adaptive_block_contexts {
+            config = config.with_adaptive_block_contexts(v);
+        }
+        if let Some(v) = options.patches {
+            config = config.with_patches(v);
+        }
+        if let Some(v) = options.gaborish {
+            config = config.with_gaborish(v);
+        }
+        if let Some(v) = options.pixel_domain_loss {
+            config = config.with_pixel_domain_loss(v);
+        }
+        if let Some(v) = options.adaptive_quant {
+            config = config.with_adaptive_quant(v);
+        }
+        if let Some(v) = options.adjust_quant_ac {
+            config = config.with_adjust_quant_ac(v);
+        }
+        if let Some(v) = options.chromacity_adjustment {
+            config = config.with_chromacity_adjustment(v);
+        }
+        if let Some(v) = options.cfl {
+            config = config.with_cfl(v);
+        }
+        if let Some(v) = options.cfl_two_pass {
+            config = config.with_cfl_two_pass(v);
+        }
+        if let Some(v) = options.epf {
+            config = config.with_epf(v);
+        }
+        if let Some(v) = options.epf_dynamic_sharpness {
+            config = config.with_epf_dynamic_sharpness(v);
+        }
+        if let Some(v) = options.optimize_codes {
+            config = config.with_optimize_codes(v);
+        }
+        // Refinement loop: 1 SSIM2 iteration at eff=5-6, 2 at eff=7+.
+        // Closes the VarDCT quality gap vs libjxl by refining the quant field
+        // based on decoded quality rather than the initial AQ estimate alone.
+        #[cfg(feature = "ssim2-loop")]
+        {
+            let iters = match options.effort {
+                5..=6 => 1,
+                7..=u8::MAX => 2,
+                _ => 0,
+            };
+            if iters > 0 {
+                config = config.with_ssim2_iters(iters);
+            }
+        }
+        config
+            .encode(pixels, width, height, layout)
+            .map_err(|error| encode_error(format!("lossy JPEG XL encoding failed: {error}")))
+    }
+}
+
+fn dynamic_image_to_decoded(
+    image: image::DynamicImage,
+    icc: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
+) -> DecodedImage {
+    let rgba = image.into_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let raw = rgba.into_raw();
+    let (pixels, alpha) = split_rgba_to_rgb_alpha(&raw);
+    DecodedImage {
+        pixels,
+        alpha,
+        icc,
+        exif,
+        width,
+        height,
+    }
+}
+
+fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|error| decode_malformed(format!("generic image decode failed: {error}")))?;
+    Ok(dynamic_image_to_decoded(image, None, None))
+}
+
+#[inline]
+fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    use crate::jpeg_decode::JpegDecoder;
+    use crate::jpeg_decode_core::bytestream::ZCursor;
+    use crate::jpeg_decode_core::colorspace::ColorSpace;
+    use crate::jpeg_decode_core::options::DecoderOptions;
+
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
+    decoder
+        .decode_headers()
+        .map_err(|e| decode_malformed(format!("JPEG header: {e}")))?;
+    let pixels = decoder
+        .decode()
+        .map_err(|e| decode_malformed(format!("JPEG decode: {e}")))?;
+    let icc = decoder.icc_profile();
+    let (width, height) = decoder
+        .dimensions()
+        .ok_or_else(|| decode_malformed("JPEG: no dimensions after decode"))?;
+    Ok(DecodedImage {
+        pixels,
+        alpha: None,
+        icc,
+        exif: extract_jpeg_exif(bytes),
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+#[inline]
+fn decode_webp_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    let reader = BufReader::new(Cursor::new(bytes));
+    let mut decoder = crate::webp_decode::WebPDecoder::new(reader).map_err(|error| {
+        decode_malformed(format!("WebP decoder initialization failed: {error}"))
+    })?;
+    let (width, height) = decoder.dimensions();
+    let has_alpha = decoder.has_alpha();
+    let mut decoded = vec![
+        0u8;
+        decoder
+            .output_buffer_size()
+            .ok_or_else(|| decode_malformed(
+                "WebP output buffer would exceed addressable memory"
+            ))?
+    ];
+    decoder
+        .read_image(&mut decoded)
+        .map_err(|error| decode_malformed(format!("WebP pixel decode failed: {error}")))?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let exif = decoder.exif_metadata().ok().flatten();
+
+    let (pixels, alpha) = if has_alpha {
+        split_rgba_to_rgb_alpha(&decoded)
+    } else {
+        (decoded, None)
+    };
+
+    Ok(DecodedImage {
+        pixels,
+        alpha,
+        icc,
+        exif,
+        width,
+        height,
+    })
+}
+
+fn decode_png_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    use png::{BitDepth, ColorType, Decoder};
+
+    let decoder = Decoder::new(bytes);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| decode_malformed(format!("PNG: {error}")))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader
+        .next_frame(&mut buf)
+        .map_err(|error| decode_malformed(format!("PNG: {error}")))?;
+    let info = reader.info();
+    let icc = info.icc_profile.as_ref().map(|profile| profile.to_vec());
+    let exif = info.exif_metadata.as_ref().map(|metadata| metadata.to_vec());
+    let width = info.width;
+    let height = info.height;
+
+    match (frame.color_type, frame.bit_depth) {
+        (ColorType::Rgb, BitDepth::Eight) => Ok(DecodedImage {
+            pixels: buf[..frame.buffer_size()].to_vec(),
+            alpha: None,
+            icc,
+            exif,
+            width,
+            height,
+        }),
+        (ColorType::Rgba, BitDepth::Eight) => {
+            let (pixels, alpha) = split_rgba_to_rgb_alpha(&buf[..frame.buffer_size()]);
+            Ok(DecodedImage {
+                pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Grayscale, BitDepth::Eight) => {
+            let data = &buf[..frame.buffer_size()];
+            let pixels = data.iter().flat_map(|&gray| [gray, gray, gray]).collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::GrayscaleAlpha, BitDepth::Eight) => {
+            let (pixels, alpha) = split_ga_to_rgb_alpha(&buf[..frame.buffer_size()]);
+            Ok(DecodedImage {
+                pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Rgb, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let pixels = data
+                .chunks_exact(6)
+                .flat_map(|pixel| [pixel[0], pixel[2], pixel[4]])
+                .collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Rgba, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
+            for pixel in data.chunks_exact(8) {
+                pixels.extend_from_slice(&[pixel[0], pixel[2], pixel[4]]);
+                alpha.push(pixel[6]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Grayscale, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let pixels = data
+                .chunks_exact(2)
+                .flat_map(|sample| [sample[0], sample[0], sample[0]])
+                .collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::GrayscaleAlpha, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
+            for pixel in data.chunks_exact(4) {
+                pixels.extend_from_slice(&[pixel[0], pixel[0], pixel[0]]);
+                alpha.push(pixel[2]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        _ => {
+            let image = image::load_from_memory(bytes)
+                .map_err(|error| decode_malformed(format!("generic image decode failed: {error}")))?;
+            Ok(dynamic_image_to_decoded(image, icc, exif))
+        }
+    }
+}
+
+fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, CrabMagickError> {
+    let options = usvg::Options::default();
+    let tree = usvg::Tree::from_data(bytes, &options)
+        .map_err(|error| decode_malformed(format!("SVG parsing failed: {error}")))?;
+
+    let natural = tree.size().to_int_size();
+    let (width, height) = resolve_output_size(natural.width(), natural.height(), out_w, out_h);
+    let sx = width as f32 / natural.width() as f32;
+    let sy = height as f32 / natural.height() as f32;
+    let transform = tiny_skia::Transform::from_scale(sx, sy);
+
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| decode_malformed("failed to allocate the SVG raster surface"))?;
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+    let mut alpha = Vec::with_capacity((width * height) as usize);
+    for rgba in pixmap.data().chunks_exact(4) {
+        let a = rgba[3] as u32;
+        alpha.push(rgba[3]);
+        if a == 0 {
+            pixels.extend_from_slice(&[0, 0, 0]);
+            continue;
+        }
+        let r = ((rgba[0] as u32 * 255) / a).min(255) as u8;
+        let g = ((rgba[1] as u32 * 255) / a).min(255) as u8;
+        let b = ((rgba[2] as u32 * 255) / a).min(255) as u8;
+        pixels.extend_from_slice(&[r, g, b]);
+    }
+
+    Ok(DecodedImage {
+        pixels,
+        alpha: maybe_some_alpha(alpha),
+        icc: None,
+        exif: None,
+        width,
+        height,
+    })
+}
+
+fn decode_svg_info(bytes: &[u8]) -> Result<ImageInfo, CrabMagickError> {
+    let options = usvg::Options::default();
+    let tree = usvg::Tree::from_data(bytes, &options)
+        .map_err(|error| decode_malformed(format!("SVG parsing failed: {error}")))?;
+    let size = tree.size().to_int_size();
+    Ok(ImageInfo {
+        width: size.width(),
+        height: size.height(),
+    })
+}
+
+#[cfg(feature = "pdf")]
+fn decode_pdf_page(
+    bytes: &[u8],
+    page: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Result<DecodedImage, CrabMagickError> {
+    let pdfium = Pdfium::default();
+    let document = pdfium
+        .load_pdf_from_byte_vec(bytes.to_vec(), None)
+        .map_err(|error| decode_malformed(format!("PDF loading failed: {error}")))?;
+    let page = document
+        .pages()
+        .get(page as u16)
+        .map_err(|error| decode_malformed(format!("PDF page lookup failed: {error}")))?;
+
+    let mut config = PdfRenderConfig::new();
+    if out_w > 0 {
+        config = config.set_target_width(out_w as i32);
+    }
+    if out_h > 0 {
+        config = config.set_target_height(out_h as i32);
+    }
+
+    let image = page
+        .render_with_config(&config)
+        .map_err(|error| decode_malformed(format!("PDF rasterization failed: {error}")))?
+        .as_image();
+    Ok(dynamic_image_to_decoded(image, None, None))
+}
+
+fn decode_tiff_page(bytes: &[u8], page: u32) -> Result<DecodedImage, CrabMagickError> {
+    let cursor = Cursor::new(bytes);
+    let reader = BufReader::new(cursor);
+    let mut decoder = TiffDecoder::new(reader).map_err(|error| {
+        decode_malformed(format!("TIFF decoder initialization failed: {error}"))
+    })?;
+
+    for _ in 0..page {
+        if decoder.more_images() {
+            decoder
+                .next_image()
+                .map_err(|error| decode_malformed(format!("TIFF page advance failed: {error}")))?;
+        } else {
+            return Err(decode_malformed(format!(
+                "TIFF page index {page} is out of range for this file",
+            )));
+        }
+    }
+
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|error| decode_malformed(format!("TIFF dimension read failed: {error}")))?;
+    let color = decoder
+        .colortype()
+        .map_err(|error| decode_malformed(format!("TIFF color-type read failed: {error}")))?;
+    let image = decoder
+        .read_image()
+        .map_err(|error| decode_malformed(format!("TIFF pixel decode failed: {error}")))?;
+
+    tiff_to_rgb(image, color, width, height)
+}
+
+fn tiff_to_rgb(
+    image: DecodingResult,
+    color: tiff::ColorType,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, CrabMagickError> {
+    match (image, color) {
+        (DecodingResult::U8(data), tiff::ColorType::Gray(8)) => {
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            for value in data {
+                pixels.extend_from_slice(&[value, value, value]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc: None,
+                exif: None,
+                width,
+                height,
+            })
+        }
+        (DecodingResult::U16(data), tiff::ColorType::Gray(16)) => {
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            for value in data {
+                let gray = (value >> 8) as u8;
+                pixels.extend_from_slice(&[gray, gray, gray]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc: None,
+                exif: None,
+                width,
+                height,
+            })
+        }
+        (DecodingResult::U8(data), tiff::ColorType::RGB(8)) => Ok(DecodedImage {
+            pixels: data,
+            alpha: None,
+            icc: None,
+            exif: None,
+            width,
+            height,
+        }),
+        (DecodingResult::U16(data), tiff::ColorType::RGB(16)) => {
+            let pixels = data.into_iter().map(|v| (v >> 8) as u8).collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc: None,
+                exif: None,
+                width,
+                height,
+            })
+        }
+        (DecodingResult::U8(data), tiff::ColorType::RGBA(8)) => {
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
+            for rgba in data.chunks_exact(4) {
+                pixels.extend_from_slice(&rgba[..3]);
+                alpha.push(rgba[3]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc: None,
+                exif: None,
+                width,
+                height,
+            })
+        }
+        (DecodingResult::U16(data), tiff::ColorType::RGBA(16)) => {
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
+            for rgba in data.chunks_exact(4) {
+                pixels.extend_from_slice(&[
+                    (rgba[0] >> 8) as u8,
+                    (rgba[1] >> 8) as u8,
+                    (rgba[2] >> 8) as u8,
+                ]);
+                alpha.push((rgba[3] >> 8) as u8);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc: None,
+                exif: None,
+                width,
+                height,
+            })
+        }
+        _ => Err(decode_unsupported_format(
+            "TIFF pixel format is unsupported; only Gray/RGB/RGBA 8-bit and 16-bit images are supported",
+        )),
+    }
+}
+
+fn planar_to_rgb(
+    pixel_format: PixelFormat,
+    r: &[f32],
+    g: Option<&[f32]>,
+    b: Option<&[f32]>,
+    width: u32,
+    height: u32,
+    pool: &JxlThreadPool,
+) -> DecodedImage {
+    let total = (width * height) as usize;
+
+    // Only parallelize when the image is large enough to amortize task-scheduling overhead.
+    // Empirically, ≥3M pixels is the break-even point.
+    const PARALLEL_THRESHOLD: usize = 3_000_000;
+    // 8192-pixel chunks: ~96 KB f32 in, ~24 KB u8 out — fits well in L1/L2 per task.
+    const CHUNK: usize = 8192;
+    let parallel = pool.is_multithreaded() && total >= PARALLEL_THRESHOLD;
+
+    // Serial path: zero-fill warms cache lines before the AVX2 write pass, avoiding demand-paging
+    // stalls on cold pages.  Parallel path: every byte is overwritten, so skip the zero-fill.
+    let mut pixels: Vec<u8> = if parallel {
+        let mut v = Vec::with_capacity(total * 3);
+        unsafe { v.set_len(total * 3) };
+        v
+    } else {
+        vec![0u8; total * 3]
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("ssse3")
+        && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = false;
+
+    match pixel_format {
+        PixelFormat::Gray | PixelFormat::Graya => {
+            if parallel {
+                // Use pool.install so par_chunks_mut runs on the warm dedicated pool threads
+                // (still spinning from the decode pass), avoiding global-pool wakeup latency.
+                pool.install(|| {
+                    pixels
+                        .par_chunks_mut(CHUNK * 3)
+                        .enumerate()
+                        .for_each(|(i, out_chunk)| {
+                            let start = i * CHUNK;
+                            let n = out_chunk.len() / 3;
+                            let r_chunk = &r[start..start + n];
+                            if avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    planar_to_rgb_gray_avx2(r_chunk, out_chunk)
+                                };
+                            } else {
+                                planar_to_rgb_gray_scalar(r_chunk, out_chunk);
+                            }
+                        });
+                });
+            } else if avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    planar_to_rgb_gray_avx2(r, &mut pixels)
+                };
+            } else {
+                planar_to_rgb_gray_scalar(r, &mut pixels);
+            }
+        }
+        PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Cmyk | PixelFormat::Cmyka => {
+            let g = g.expect("green plane present for RGB-like JXL image");
+            let b = b.expect("blue plane present for RGB-like JXL image");
+
+            if parallel {
+                pool.install(|| {
+                    pixels
+                        .par_chunks_mut(CHUNK * 3)
+                        .enumerate()
+                        .for_each(|(i, out_chunk)| {
+                            let start = i * CHUNK;
+                            let n = out_chunk.len() / 3;
+                            let r_chunk = &r[start..start + n];
+                            let g_chunk = &g[start..start + n];
+                            let b_chunk = &b[start..start + n];
+                            if avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    planar_to_rgb_rgb_avx2(r_chunk, g_chunk, b_chunk, out_chunk)
+                                };
+                            } else {
+                                planar_to_rgb_rgb_scalar(r_chunk, g_chunk, b_chunk, out_chunk);
+                            }
+                        });
+                });
+            } else if avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    planar_to_rgb_rgb_avx2(r, g, b, &mut pixels)
+                };
+            } else {
+                planar_to_rgb_rgb_scalar(r, g, b, &mut pixels);
+            }
+        }
+    }
+
+    DecodedImage {
+        pixels,
+        alpha: None,
+        icc: None,
+        exif: None,
+        width,
+        height,
+    }
+}
+
+#[inline(always)]
+fn f32_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+fn planar_to_rgb_gray_scalar(r: &[f32], out: &mut [u8]) {
+    for (chunk, &value) in out.chunks_exact_mut(3).zip(r.iter()) {
+        let gray = f32_to_u8(value);
+        chunk[0] = gray;
+        chunk[1] = gray;
+        chunk[2] = gray;
+    }
+}
+
+fn planar_to_rgb_rgb_scalar(r: &[f32], g: &[f32], b: &[f32], out: &mut [u8]) {
+    for (chunk, ((rv, gv), bv)) in out
+        .chunks_exact_mut(3)
+        .zip(r.iter().zip(g.iter()).zip(b.iter()))
+    {
+        chunk[0] = f32_to_u8(*rv);
+        chunk[1] = f32_to_u8(*gv);
+        chunk[2] = f32_to_u8(*bv);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,ssse3,fma")]
+unsafe fn planar_to_rgb_rgb_avx2(r: &[f32], g: &[f32], b: &[f32], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(r.len(), g.len());
+    debug_assert_eq!(r.len(), b.len());
+    debug_assert_eq!(out.len(), r.len() * 3);
+
+    #[inline(always)]
+    unsafe fn quantize_u8x8(values: &[f32], index: usize) -> __m256i {
+        use std::arch::x86_64::*;
+
+        let zero = _mm256_setzero_ps();
+        let scale = _mm256_set1_ps(255.0);
+        let round = _mm256_set1_ps(0.5);
+        let max_u8 = _mm256_set1_ps(255.0);
+        let value = unsafe { _mm256_loadu_ps(values.as_ptr().add(index)) };
+        let value = _mm256_max_ps(value, zero);
+        let value = _mm256_fmadd_ps(value, scale, round);
+        let value = _mm256_min_ps(value, max_u8);
+        _mm256_cvttps_epi32(value)
+    }
+
+    #[inline(always)]
+    unsafe fn store_rgb_4pixels(dst: *mut u8, packed: __m128i, shuffle: __m128i) {
+        use std::arch::x86_64::*;
+
+        let packed = _mm_shuffle_epi8(packed, shuffle);
+        unsafe {
+            _mm_storel_epi64(dst.cast::<__m128i>(), packed);
+            std::ptr::write_unaligned(
+                dst.add(8).cast::<u32>(),
+                _mm_extract_epi32::<2>(packed) as u32,
+            );
+        }
+    }
+
+    let shuffle = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+    let zero = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 8 <= r.len() {
+        let ir = unsafe { quantize_u8x8(r, i) };
+        let ig = unsafe { quantize_u8x8(g, i) };
+        let ib = unsafe { quantize_u8x8(b, i) };
+        let rg16 = _mm256_packs_epi32(ir, ig);
+        let b016 = _mm256_packs_epi32(ib, zero);
+        let rgb8 = _mm256_packus_epi16(rg16, b016);
+        let lane0 = _mm256_castsi256_si128(rgb8);
+        let lane1 = _mm256_extracti128_si256::<1>(rgb8);
+        let dst = unsafe { out.as_mut_ptr().add(i * 3) };
+        unsafe {
+            store_rgb_4pixels(dst, lane0, shuffle);
+            store_rgb_4pixels(dst.add(12), lane1, shuffle);
+        }
+        i += 8;
+    }
+
+    planar_to_rgb_rgb_scalar(&r[i..], &g[i..], &b[i..], &mut out[i * 3..]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,ssse3,fma")]
+unsafe fn planar_to_rgb_gray_avx2(r: &[f32], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(out.len(), r.len() * 3);
+
+    #[inline(always)]
+    unsafe fn quantize_u8x8(values: &[f32], index: usize) -> __m256i {
+        use std::arch::x86_64::*;
+
+        let zero = _mm256_setzero_ps();
+        let scale = _mm256_set1_ps(255.0);
+        let round = _mm256_set1_ps(0.5);
+        let max_u8 = _mm256_set1_ps(255.0);
+        let value = unsafe { _mm256_loadu_ps(values.as_ptr().add(index)) };
+        let value = _mm256_max_ps(value, zero);
+        let value = _mm256_fmadd_ps(value, scale, round);
+        let value = _mm256_min_ps(value, max_u8);
+        _mm256_cvttps_epi32(value)
+    }
+
+    #[inline(always)]
+    unsafe fn store_rgb_4pixels(dst: *mut u8, packed: __m128i, shuffle: __m128i) {
+        use std::arch::x86_64::*;
+
+        let packed = _mm_shuffle_epi8(packed, shuffle);
+        unsafe {
+            _mm_storel_epi64(dst.cast::<__m128i>(), packed);
+            std::ptr::write_unaligned(
+                dst.add(8).cast::<u32>(),
+                _mm_extract_epi32::<2>(packed) as u32,
+            );
+        }
+    }
+
+    let shuffle = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+    let mut i = 0usize;
+    while i + 8 <= r.len() {
+        let iv = unsafe { quantize_u8x8(r, i) };
+        let rrgg16 = _mm256_packs_epi32(iv, iv);
+        let rgb8 = _mm256_packus_epi16(rrgg16, rrgg16);
+        let lane0 = _mm256_castsi256_si128(rgb8);
+        let lane1 = _mm256_extracti128_si256::<1>(rgb8);
+        let dst = unsafe { out.as_mut_ptr().add(i * 3) };
+        unsafe {
+            store_rgb_4pixels(dst, lane0, shuffle);
+            store_rgb_4pixels(dst.add(12), lane1, shuffle);
+        }
+        i += 8;
+    }
+
+    planar_to_rgb_gray_scalar(&r[i..], &mut out[i * 3..]);
+}
+
+/// Fused XYB→sRGB → interleaved u8 RGB in a single pass.
+///
+/// Applies, per pixel, `XybToMixedLms(opsin_bias, intensity_target)`, the 3×3
+/// mixed-LMS→linear-sRGB `matrix`, and the sRGB transfer curve, then quantizes straight to
+/// packed RGB24. This is mathematically identical to running the standalone `ColorTransform`
+/// (XYB→sRGB) followed by [`planar_to_rgb`] — bit-identical on the AVX2 path, and within ≤1 u8
+/// on scalar tails — but avoids an extra full-image read/write pass over the f32 planes.
+fn planar_to_rgb_fused_xyb_srgb(
+    x: &[f32],
+    y: &[f32],
+    b: &[f32],
+    width: u32,
+    height: u32,
+    params: &XybSrgbParams,
+    pool: &JxlThreadPool,
+) -> DecodedImage {
+    let total = (width * height) as usize;
+
+    // Mirror `planar_to_rgb`'s scheduling: parallelize only above the amortization threshold.
+    const PARALLEL_THRESHOLD: usize = 3_000_000;
+    const CHUNK: usize = 8192;
+    let parallel = pool.is_multithreaded() && total >= PARALLEL_THRESHOLD;
+
+    let mut pixels: Vec<u8> = if parallel {
+        let mut v = Vec::with_capacity(total * 3);
+        // SAFETY: every byte is overwritten by the fused pass below before being read.
+        unsafe { v.set_len(total * 3) };
+        v
+    } else {
+        vec![0u8; total * 3]
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("ssse3")
+        && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = false;
+
+    let params = *params;
+
+    if parallel {
+        pool.install(|| {
+            pixels
+                .par_chunks_mut(CHUNK * 3)
+                .enumerate()
+                .for_each(|(i, out_chunk)| {
+                    let start = i * CHUNK;
+                    let n = out_chunk.len() / 3;
+                    let xs = &x[start..start + n];
+                    let ys = &y[start..start + n];
+                    let bs = &b[start..start + n];
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            fused_xyb_srgb_rgb_avx2(xs, ys, bs, out_chunk, &params)
+                        };
+                    } else {
+                        fused_xyb_srgb_rgb_scalar(xs, ys, bs, out_chunk, &params);
+                    }
+                });
+        });
+    } else if avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            fused_xyb_srgb_rgb_avx2(x, y, b, &mut pixels, &params)
+        };
+    } else {
+        fused_xyb_srgb_rgb_scalar(x, y, b, &mut pixels, &params);
+    }
+
+    DecodedImage {
+        pixels,
+        alpha: None,
+        icc: None,
+        exif: None,
+        width,
+        height,
+    }
+}
+
+fn fused_xyb_srgb_rgb_scalar(
+    x: &[f32],
+    y: &[f32],
+    b: &[f32],
+    out: &mut [u8],
+    params: &XybSrgbParams,
+) {
+    use crate::jxl_decode::jxl_color::linear_to_srgb_scalar_one;
+
+    let ob = params.opsin_bias;
+    let cbrt_ob = [ob[0].cbrt(), ob[1].cbrt(), ob[2].cbrt()];
+    let itscale = 255.0 / params.intensity_target;
+    let m = params.matrix;
+
+    for (((chunk, &xi), &yi), &bi) in out
+        .chunks_exact_mut(3)
+        .zip(x.iter())
+        .zip(y.iter())
+        .zip(b.iter())
+    {
+        // XybToMixedLms
+        let g_l = yi + xi - cbrt_ob[0];
+        let g_m = yi - xi - cbrt_ob[1];
+        let g_s = bi - cbrt_ob[2];
+        let v0 = (g_l * g_l).mul_add(g_l, ob[0]) * itscale;
+        let v1 = (g_m * g_m).mul_add(g_m, ob[1]) * itscale;
+        let v2 = (g_s * g_s).mul_add(g_s, ob[2]) * itscale;
+        // Mixed LMS → linear sRGB
+        let r = m[0] * v0 + m[1] * v1 + m[2] * v2;
+        let g = m[3] * v0 + m[4] * v1 + m[5] * v2;
+        let bl = m[6] * v0 + m[7] * v1 + m[8] * v2;
+        // sRGB transfer + quantize
+        chunk[0] = f32_to_u8(linear_to_srgb_scalar_one(r));
+        chunk[1] = f32_to_u8(linear_to_srgb_scalar_one(g));
+        chunk[2] = f32_to_u8(linear_to_srgb_scalar_one(bl));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,ssse3,fma")]
+unsafe fn fused_xyb_srgb_rgb_avx2(
+    x: &[f32],
+    y: &[f32],
+    b: &[f32],
+    out: &mut [u8],
+    params: &XybSrgbParams,
+) {
+    use crate::jxl_decode::jxl_color::{linear_to_srgb_avx2_x8, srgb_powtables};
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(x.len(), y.len());
+    debug_assert_eq!(x.len(), b.len());
+    debug_assert_eq!(out.len(), x.len() * 3);
+
+    let ob = params.opsin_bias;
+    let itscale = 255.0 / params.intensity_target;
+    let cbrt_ob = [ob[0].cbrt(), ob[1].cbrt(), ob[2].cbrt()];
+    let m = params.matrix;
+
+    // XybToMixedLms constants (see jxl_color::xyb::run_x86_64_avx2).
+    let vcbrt0 = _mm256_set1_ps(cbrt_ob[0]);
+    let vcbrt1 = _mm256_set1_ps(cbrt_ob[1]);
+    let vcbrt2 = _mm256_set1_ps(cbrt_ob[2]);
+    let vob0 = _mm256_set1_ps(ob[0] * itscale);
+    let vob1 = _mm256_set1_ps(ob[1] * itscale);
+    let vob2 = _mm256_set1_ps(ob[2] * itscale);
+    let vits = _mm256_set1_ps(itscale);
+    // 3×3 matrix constants (see jxl_color::convert::matrix3x3_avx2).
+    let m0 = _mm256_set1_ps(m[0]);
+    let m1 = _mm256_set1_ps(m[1]);
+    let m2 = _mm256_set1_ps(m[2]);
+    let m3 = _mm256_set1_ps(m[3]);
+    let m4 = _mm256_set1_ps(m[4]);
+    let m5 = _mm256_set1_ps(m[5]);
+    let m6 = _mm256_set1_ps(m[6]);
+    let m7 = _mm256_set1_ps(m[7]);
+    let m8 = _mm256_set1_ps(m[8]);
+    // sRGB power tables.
+    let (pt_upper, pt_lower) = srgb_powtables();
+    // Quantize constants (see planar_to_rgb_rgb_avx2).
+    let qzero = _mm256_setzero_ps();
+    let qscale = _mm256_set1_ps(255.0);
+    let qround = _mm256_set1_ps(0.5);
+    let qmax = _mm256_set1_ps(255.0);
+    let packzero = _mm256_setzero_si256();
+    let shuffle = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+
+    #[inline(always)]
+    unsafe fn quantize_u8x8(
+        v: __m256,
+        zero: __m256,
+        scale: __m256,
+        round: __m256,
+        max: __m256,
+    ) -> __m256i {
+        let v = _mm256_max_ps(v, zero);
+        let v = _mm256_fmadd_ps(v, scale, round);
+        let v = _mm256_min_ps(v, max);
+        _mm256_cvttps_epi32(v)
+    }
+
+    #[inline(always)]
+    unsafe fn store_rgb_4pixels(dst: *mut u8, packed: __m128i, shuffle: __m128i) {
+        let packed = _mm_shuffle_epi8(packed, shuffle);
+        _mm_storel_epi64(dst.cast::<__m128i>(), packed);
+        std::ptr::write_unaligned(
+            dst.add(8).cast::<u32>(),
+            _mm_extract_epi32::<2>(packed) as u32,
+        );
+    }
+
+    let px = x.as_ptr();
+    let py = y.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut i = 0usize;
+    while i + 8 <= x.len() {
+        let xv = _mm256_loadu_ps(px.add(i));
+        let yv = _mm256_loadu_ps(py.add(i));
+        let bv = _mm256_loadu_ps(pb.add(i));
+
+        // XybToMixedLms: g = matrix(xyb) - cbrt(ob); out = g³·itscale + ob·itscale
+        let g_l = _mm256_sub_ps(_mm256_add_ps(yv, xv), vcbrt0);
+        let g_m = _mm256_sub_ps(_mm256_sub_ps(yv, xv), vcbrt1);
+        let g_s = _mm256_sub_ps(bv, vcbrt2);
+        let gl3 = _mm256_mul_ps(_mm256_mul_ps(g_l, g_l), g_l);
+        let gm3 = _mm256_mul_ps(_mm256_mul_ps(g_m, g_m), g_m);
+        let gs3 = _mm256_mul_ps(_mm256_mul_ps(g_s, g_s), g_s);
+        let v0 = _mm256_fmadd_ps(gl3, vits, vob0);
+        let v1 = _mm256_fmadd_ps(gm3, vits, vob1);
+        let v2 = _mm256_fmadd_ps(gs3, vits, vob2);
+
+        // Mixed LMS → linear sRGB (row-major 3×3).
+        let r = _mm256_fmadd_ps(m0, v0, _mm256_fmadd_ps(m1, v1, _mm256_mul_ps(m2, v2)));
+        let g = _mm256_fmadd_ps(m3, v0, _mm256_fmadd_ps(m4, v1, _mm256_mul_ps(m5, v2)));
+        let bl = _mm256_fmadd_ps(m6, v0, _mm256_fmadd_ps(m7, v1, _mm256_mul_ps(m8, v2)));
+
+        // Linear sRGB → sRGB gamma.
+        let r = linear_to_srgb_avx2_x8(r, pt_upper, pt_lower);
+        let g = linear_to_srgb_avx2_x8(g, pt_upper, pt_lower);
+        let bl = linear_to_srgb_avx2_x8(bl, pt_upper, pt_lower);
+
+        // Quantize to u8 and interleave RGB.
+        let ir = quantize_u8x8(r, qzero, qscale, qround, qmax);
+        let ig = quantize_u8x8(g, qzero, qscale, qround, qmax);
+        let ib = quantize_u8x8(bl, qzero, qscale, qround, qmax);
+        let rg16 = _mm256_packs_epi32(ir, ig);
+        let b016 = _mm256_packs_epi32(ib, packzero);
+        let rgb8 = _mm256_packus_epi16(rg16, b016);
+        let lane0 = _mm256_castsi256_si128(rgb8);
+        let lane1 = _mm256_extracti128_si256::<1>(rgb8);
+        let dst = out.as_mut_ptr().add(i * 3);
+        store_rgb_4pixels(dst, lane0, shuffle);
+        store_rgb_4pixels(dst.add(12), lane1, shuffle);
+        i += 8;
+    }
+
+    // Scalar tail (identical math to the AVX2 remainder path).
+    fused_xyb_srgb_rgb_scalar(&x[i..], &y[i..], &b[i..], &mut out[i * 3..], params);
+}
+
+fn apply_post_decode_ops(
+    image: DecodedImage,
+    region: Option<(u32, u32, u32, u32)>,
+    square: bool,
+) -> Result<DecodedImage, CrabMagickError> {
+    if let Some((x, y, w, h)) = region {
+        let requested_region = RequestedRegion::new(x, y, w, h);
+        let image_info = ImageInfo {
+            width: image.width,
+            height: image.height,
+        };
+        validate_requested_region(requested_region, image_info)?;
+        return Ok(apply_region(image, requested_region));
+    }
+    if square {
+        return Ok(square_crop(image));
+    }
+    Ok(image)
+}
+
+fn validate_requested_region(
+    region: RequestedRegion,
+    image: ImageInfo,
+) -> Result<(), CrabMagickError> {
+    if region.width == 0 || region.height == 0 {
+        return Err(decode_malformed(
+            "requested region width and height must both be greater than zero",
+        ));
+    }
+
+    if image.contains_region(region) {
+        Ok(())
+    } else {
+        Err(region_out_of_bounds(region, image))
+    }
+}
+
+fn apply_region(image: DecodedImage, region: RequestedRegion) -> DecodedImage {
+    if region.left == 0
+        && region.top == 0
+        && region.width == image.width
+        && region.height == image.height
+    {
+        return image;
+    }
+
+    let source_stride = image.width as usize * 3;
+    let destination_stride = region.width as usize * 3;
+    let mut pixels = vec![0u8; (region.width * region.height * 3) as usize];
+
+    for row in 0..region.height as usize {
+        let src_offset = (region.top as usize + row) * source_stride + region.left as usize * 3;
+        let dst_offset = row * destination_stride;
+        pixels[dst_offset..dst_offset + destination_stride]
+            .copy_from_slice(&image.pixels[src_offset..src_offset + destination_stride]);
+    }
+
+    let alpha = image
+        .alpha
+        .as_ref()
+        .map(|channel| crop_plane_u8(channel, image.width, region));
+
+    DecodedImage {
+        pixels,
+        alpha,
+        icc: image.icc,
+        exif: image.exif,
+        width: region.width,
+        height: region.height,
+    }
+}
+
+fn square_crop(image: DecodedImage) -> DecodedImage {
+    let side = image.width.min(image.height);
+    let region = RequestedRegion::new(
+        (image.width - side) / 2,
+        (image.height - side) / 2,
+        side,
+        side,
+    );
+    apply_region(image, region)
+}
+
+fn encode_avif_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::AvifEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
+    #[cfg(feature = "avif")]
+    {
+        validate_rgb8_buffer(pixels, width, height, "AVIF")?;
+        if let Some(alpha) = alpha {
+            validate_alpha8_buffer(alpha, width, height, "AVIF")?;
+        }
+        let quality = if options.lossless {
+            100.0
+        } else {
+            options.quality.clamp(1, 100) as f32
+        };
+        let mut encoder = AvifEncoder::new()
+            .with_quality(quality)
+            .with_alpha_quality(100.0)
+            .with_speed(options.effort.clamp(1, 10));
+        if options.lossless {
+            encoder = encoder.with_internal_color_model(AvifColorModel::RGB);
+        }
+        let encoded = if let Some(alpha) = alpha {
+            let pixels: Vec<AvifRgba8> = pixels
+                .chunks_exact(3)
+                .zip(alpha.iter())
+                .map(|(chunk, &a)| AvifRgba8::new(chunk[0], chunk[1], chunk[2], a))
+                .collect();
+            encoder
+                .encode_rgba(AvifImg::new(
+                    pixels.as_slice(),
+                    width as usize,
+                    height as usize,
+                ))
+                .map_err(|error| encode_error(format!("AVIF encoding failed: {error}")))?
+        } else {
+            let pixels: Vec<AvifRgb8> = pixels
+                .chunks_exact(3)
+                .map(|chunk| AvifRgb8::new(chunk[0], chunk[1], chunk[2]))
+                .collect();
+            encoder
+                .encode_rgb(AvifImg::new(
+                    pixels.as_slice(),
+                    width as usize,
+                    height as usize,
+                ))
+                .map_err(|error| encode_error(format!("AVIF encoding failed: {error}")))?
+        };
+        Ok(encoded.avif_file)
+    }
+    #[cfg(not(feature = "avif"))]
+    {
+        let _ = (pixels, width, height, options, alpha);
+        Err(encode_error(
+            "AVIF output is unavailable in this build; enable the `avif` feature",
+        ))
+    }
+}
+
+fn resolve_output_size(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> (u32, u32) {
+    match (out_w, out_h) {
+        (0, 0) => (src_w, src_h),
+        (w, 0) => {
+            let h = ((src_h as u64 * w as u64) / src_w.max(1) as u64).max(1) as u32;
+            (w.max(1), h)
+        }
+        (0, h) => {
+            let w = ((src_w as u64 * h as u64) / src_h.max(1) as u64).max(1) as u32;
+            (w, h.max(1))
+        }
+        (w, h) => (w.max(1), h.max(1)),
+    }
+}
+
+fn distance_from_quality(quality: u8) -> f32 {
+    let quality = quality.clamp(1, 100) as f32;
+    (100.0 - quality) / 25.0 + 0.5
+}
+
+#[cfg(test)]
+mod fused_color_tests {
+    use super::*;
+
+    const TEST_JXL: &str =
+        "/home/mattia/Work/IIIF_Server/var/storage/f7f3/401b/7c27/455b/907c/b30e/8d8a/eb9f/50.jxl";
+
+    // Reference XYB→sRGB params in the same shape the decoder produces (SDR sRGB, identity-ish
+    // opsin bias and inverse matrix). Used only to exercise the fused kernels on synthetic data.
+    fn sample_params() -> XybSrgbParams {
+        XybSrgbParams {
+            opsin_bias: [-0.0037930734, -0.0037930734, -0.0037930734],
+            intensity_target: 255.0,
+            matrix: [
+                11.031566906728434,
+                -9.866943921515768,
+                -0.16462298521266537,
+                -3.254147380524915,
+                4.418770377582723,
+                -0.16462299105770887,
+                -3.6588512867136815,
+                2.7129230459994800,
+                1.9459282407141877,
+            ]
+            .map(|v: f64| v as f32),
+        }
+    }
+
+    #[test]
+    fn fused_scalar_matches_avx2() {
+        let params = sample_params();
+        let n = 1000usize;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut b = Vec::with_capacity(n);
+        // Deterministic pseudo-random XYB-ish values.
+        let mut s: u32 = 0x1234_5678;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / 16_777_216.0 - 0.5) * 0.6
+        };
+        for _ in 0..n {
+            x.push(next() * 0.1);
+            y.push(next() + 0.3);
+            b.push(next() + 0.3);
+        }
+
+        let mut out_scalar = vec![0u8; n * 3];
+        fused_xyb_srgb_rgb_scalar(&x, &y, &b, &mut out_scalar, &params);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("ssse3")
+            && std::is_x86_feature_detected!("fma")
+        {
+            let mut out_avx2 = vec![0u8; n * 3];
+            unsafe { fused_xyb_srgb_rgb_avx2(&x, &y, &b, &mut out_avx2, &params) };
+            let max = out_scalar
+                .iter()
+                .zip(&out_avx2)
+                .map(|(a, b)| (*a as i32 - *b as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(max <= 1, "scalar vs avx2 fused mismatch, max diff {max}");
+        }
+    }
+
+    #[test]
+    fn fused_decode_matches_reference() {
+        let bytes = match std::fs::read(TEST_JXL) {
+            Ok(b) => b,
+            Err(_) => return, // test image not present in this environment
+        };
+
+        // Fused fast path (production decode).
+        let fused = decode_jxl_from_bytes(&bytes).expect("fused decode");
+
+        // Reference path: run the full standalone color transform, then pack.
+        let image = create_jxl_image(&bytes, None).expect("image");
+        let width = image.width();
+        let height = image.height();
+        let pixel_format = image.pixel_format();
+        let frame = image.render_frame(0).expect("render");
+        let pool = image.pool();
+        let raw = frame
+            .color_channels_raw_f32()
+            .expect("reference zero-copy channels");
+        let reference = planar_to_rgb(
+            pixel_format,
+            raw[0],
+            raw.get(1).copied(),
+            raw.get(2).copied(),
+            width,
+            height,
+            pool,
+        );
+
+        assert_eq!(fused.width, reference.width);
+        assert_eq!(fused.height, reference.height);
+        assert_eq!(fused.pixels.len(), reference.pixels.len());
+
+        let mut max_diff = 0i32;
+        let mut ndiff = 0usize;
+        for (a, b) in fused.pixels.iter().zip(reference.pixels.iter()) {
+            let d = (*a as i32 - *b as i32).abs();
+            if d != 0 {
+                ndiff += 1;
+            }
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff <= 1,
+            "fused vs reference max u8 diff {max_diff} ({ndiff} px differ)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod encoder_roundtrip_tests {
+    use super::*;
+    use image::{ImageEncoder, codecs::png::PngEncoder};
+
+    // Deterministic gradient RGB8 image with a bounded number of distinct colors so
+    // that lossless codecs roundtrip exactly and palettized GIF stays close.
+    fn sample_rgb(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let r = ((x * 255) / width.max(1)) as u8;
+                let g = ((y * 255) / height.max(1)) as u8;
+                let b = (((x + y) * 255) / (width + height).max(1)) as u8;
+                pixels.extend_from_slice(&[r, g, b]);
+            }
+        }
+        pixels
+    }
+
+    fn assert_jxl_lossless_roundtrip(effort: u8) {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_jxl_rgb(
+            &src,
+            w,
+            h,
+            &JxlEncodeOptions {
+                lossless: true,
+                effort,
+                ..JxlEncodeOptions::default()
+            },
+        )
+        .expect("jxl lossless encode");
+        let decoded = decode_jxl_from_bytes(&encoded).expect("jxl lossless decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(
+            decoded.pixels, src,
+            "JXL lossless roundtrip must be pixel-perfect"
+        );
+    }
+
+    #[test]
+    fn tiff_roundtrip_is_lossless() {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_tiff_rgb(&src, w, h, &crate::processor::TiffEncodeOptions::default())
+            .expect("tiff encode");
+        let decoded = decode_via_image(&encoded).expect("tiff decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "TIFF LZW roundtrip must be exact");
+    }
+
+    #[test]
+    fn bmp_roundtrip_is_lossless() {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_bmp_rgb(&src, w, h).expect("bmp encode");
+        let decoded = decode_via_image(&encoded).expect("bmp decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "BMP roundtrip must be exact");
+    }
+
+    #[test]
+    fn gif_roundtrip_preserves_shape() {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_gif_rgb(&src, w, h, &crate::processor::GifEncodeOptions::default())
+            .expect("gif encode");
+        let decoded = decode_via_image(&encoded).expect("gif decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels.len(), src.len());
+        // GIF is palettized (256 colors); this gradient has more, so expect only a
+        // bounded quantization error rather than exact equality.
+        let mut sum = 0u64;
+        for (a, b) in decoded.pixels.iter().zip(&src) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mean = sum as f64 / src.len() as f64;
+        assert!(mean < 12.0, "GIF mean abs error too high: {mean}");
+    }
+
+    #[test]
+    fn encode_rejects_wrong_buffer_len() {
+        let bad = vec![0u8; 10];
+        assert!(encode_tiff_rgb(
+            &bad,
+            64,
+            48,
+            &crate::processor::TiffEncodeOptions::default(),
+        )
+        .is_err());
+        assert!(encode_bmp_rgb(&bad, 64, 48).is_err());
+        assert!(
+            encode_gif_rgb(&bad, 64, 48, &crate::processor::GifEncodeOptions::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn jpeg_decoder_roundtrip() {
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        // Encode at high quality with 4:4:4 subsampling so the lossy error stays small.
+        let config = EncoderConfig::ycbcr(95u8, JpegChromaSubsampling::None);
+        let mut enc = config
+            .encode_from_bytes(w, h, ZenLayout::Rgb8Srgb)
+            .expect("jpeg encoder init");
+        enc.push_packed(&src, Unstoppable)
+            .expect("jpeg push pixels");
+        let jpeg = enc.finish().expect("jpeg encode");
+
+        let decoded = decode_jpeg_fast(&jpeg).expect("jpeg decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels.len(), src.len());
+        for (o, d) in src.iter().zip(decoded.pixels.iter()) {
+            let diff = (i32::from(*o) - i32::from(*d)).abs();
+            assert!(diff <= 4, "JPEG pixel diff {diff} > 4");
+        }
+    }
+
+    #[test]
+    fn webp_decoder_roundtrip() {
+        // NOTE: the crate's own `encode_lossy_webp` currently produces bitstreams that
+        // the decoder cannot reproduce faithfully (a pre-existing VP8 encoder bug), so
+        // this test decodes a reference WebP produced by libwebp (via Pillow) from the
+        // same gradient and checks our lossy VP8 + YUV->RGB path against the source.
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        let webp = include_bytes!("../tests/data/gradient_64.webp");
+
+        let decoded = decode_webp_fast(webp).expect("webp decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels.len(), src.len());
+        for (o, d) in src.iter().zip(decoded.pixels.iter()) {
+            let diff = (i32::from(*o) - i32::from(*d)).abs();
+            assert!(diff <= 8, "WebP pixel diff {diff} > 8");
+        }
+    }
+
+    #[test]
+    fn webp_lossless_roundtrip_is_exact() {
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        let mut encoded = Vec::new();
+        crate::webp_decode::WebPEncoder::new(&mut encoded)
+            .encode(&src, w, h, crate::webp_decode::ColorType::Rgb8)
+            .expect("webp lossless encode");
+
+        let decoded = decode_webp_fast(&encoded).expect("webp lossless decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(
+            decoded.pixels, src,
+            "lossless WebP roundtrip must be pixel-perfect"
+        );
+    }
+
+    #[test]
+    fn jxl_lossless_roundtrip_is_exact() {
+        assert_jxl_lossless_roundtrip(5);
+    }
+
+    #[test]
+    fn jxl_lossless_roundtrip_effort1() {
+        assert_jxl_lossless_roundtrip(1);
+    }
+
+    #[test]
+    fn jxl_lossless_roundtrip_effort9() {
+        assert_jxl_lossless_roundtrip(9);
+    }
+
+    #[test]
+    fn png_decoder_roundtrip() {
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&src, w, h, ColorType::Rgb8.into())
+            .expect("png encode");
+
+        let decoded = decode_via_image(&png).expect("png decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "PNG roundtrip must be lossless");
+    }
+}
